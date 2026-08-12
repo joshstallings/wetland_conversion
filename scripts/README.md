@@ -1,8 +1,9 @@
 # scripts
 
-GEE-side pipelines for pulling AlphaEarth Foundations embeddings for Florida,
-plus the shared config they both depend on. Everything here runs in the
-`wetlands` mamba env, from the repo root (`python scripts/<name>.py ...`).
+Pipelines for pulling AlphaEarth Foundations embeddings for Florida and
+joining them onto the NLCD wetland samples, plus the shared config the GEE
+scripts depend on. Everything here runs in the `wetlands` mamba env, from the
+repo root (`python scripts/<name>.py ...`).
 
 ## gee_common.py
 
@@ -26,3 +27,15 @@ result to uint8, and exports one GeoTIFF per (tile, year) to
 `status`, `task`) check the math and the GCS export path before committing to
 the full statewide batch.
 
+## join_alphaearth_samples.py
+
+Joins the AlphaEarth tiles `export_alphaearth_30m.py` has pulled down onto
+`data/processed/wetland_sample_labels_2019_2024.parquet`, producing one row
+per wetland pixel with a 2017/2018/2019 embedding stack (`A00_2017`...`A63_2019`)
+alongside the label columns. `extract-tile`/`extract-all` pull decoded band
+values per (tile, year) into `data/processed/alphaearth_extract/`; `assemble`
+inner-joins a tile's extracted years into
+`data/processed/alphaearth_wetland_joined/{tile_id}.parquet` once all of them
+are done. Both stages skip whatever's already on disk, so re-running
+`extract-all` then `assemble` as more tiles finish downloading just picks up
+the new ones - `status` shows tif/extract/assemble progress per tile.

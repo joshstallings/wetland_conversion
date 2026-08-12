@@ -40,6 +40,14 @@ Usage:
     python scripts/export_alphaearth_30m.py task TASK_ID
         Checks one task by id directly - for test-tile's task, or any other.
 
+    python scripts/export_alphaearth_30m.py validate-tile [--tile-id ID] [--year Y]
+        Checks a real, already-downloaded export (defaults to whatever's
+        already in data/AlphaEarth/) against a fresh synchronous
+        recomputation of the same recipe for a small patch - confirms the
+        file on disk is actually the pixels year_tile_image_30m produces
+        today, not just well-formed. Read-only, safe alongside a running
+        submit batch.
+
     python scripts/export_alphaearth_30m.py submit --years 2017 2018 2019 [--limit N]
         Submits the statewide batch, one task per (tile, year). Safe to
         re-run - tile-years already logged in the manifest are skipped.
@@ -76,6 +84,7 @@ from gee_common import (
     TILE_GRID_30M_PATH,
     TILE_SIZE_PX_30M,
     init_ee,
+    year_collection,
     year_image,
     year_native_projection,
 )
@@ -100,6 +109,13 @@ NODATA = 0
 COMPUTE_BUFFER_M = 2_000
 
 TEST_LON, TEST_LAT = -80.9, 25.3  # Everglades marsh - actual wetland signal rather than an arbitrary corner of the grid
+
+# defaults point at the one real tile already sitting in data/AlphaEarth/, so
+# `validate-tile` with no args just works against whatever's on disk right now
+VALIDATE_DEFAULT_TILE_ID = "r039_c056"
+VALIDATE_DEFAULT_YEAR = 2017
+VALIDATE_PATCH_PX = 200  # sub-window for the getDownloadURL cross-check - full tile x 64 bands would risk its sync size cap
+VALIDATE_NUM_BANDS = 8  # getPixels' sync memory limit is per band count, not just per output pixel count - trim bands, not area
 
 MANIFEST_FIELDS = ["tile_id", "year", "task_id", "description", "status"]
 
@@ -223,6 +239,21 @@ def nearest_tile(grid):
     return grid.loc[dists.idxmin()]
 
 
+def load_tile_row(grid, tile_id: str):
+    """Exact tile_id lookup, unlike nearest_tile's distance search - for
+    validate-tile we already know which tile we're checking."""
+    match = grid[grid.tile_id == tile_id]
+    if match.empty:
+        raise SystemExit(f"tile_id {tile_id} not found in {TILE_GRID_30M_PATH}")
+    return match.iloc[0]
+
+
+def local_tile_path(tile_id: str, year: int) -> str:
+    """Where a real (non-test) export lands locally once pulled from GCS -
+    mirrors the `description` naming cmd_submit already uses."""
+    return f"data/AlphaEarth/AlphaEarth30m_Florida_{year}_{tile_id}.tif"
+
+
 def cmd_test_tile(args):
     init_ee()
     grid = load_grid()
@@ -250,6 +281,174 @@ def cmd_test_tile(args):
     # not manifest-tracked (manifest is only for the resumable submit batch,
     # see cmd_submit), so `status` won't show this - check the task directly
     print(f"poll with: python scripts/export_alphaearth_30m.py task {task.id}")
+
+
+def cmd_validate_tile(args):
+    """Checks a real, already-downloaded export against a fresh synchronous
+    recomputation of the same recipe - not just that the file is well-formed,
+    but that it's actually the pixels year_tile_image_30m would produce today.
+    Read-only against the manifest/GCS, safe to run while submit is still
+    going in another process."""
+    import numpy as np
+    import rasterio
+    from rasterio.windows import Window
+
+    path = local_tile_path(args.tile_id, args.year)
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} doesn't exist yet - check `status` for {args.tile_id}/{args.year}")
+
+    print(f"structural checks: {path}")
+    with rasterio.open(path) as src:
+        print(f"shape: {src.count} bands, {src.width}x{src.height}, dtype {src.dtypes[0]}")
+        print(f"crs: {src.crs}")
+        print(f"transform: {src.transform}")
+        print(f"nodata: {src.nodata}")
+
+        # one band at a time rather than src.read() - 64 bands of 2000x2000
+        # uint8 is only ~256MB, but there's no reason to hold it all just to
+        # take a min/max. Keep band 1 around, though - it doubles as the
+        # nodata mask used below to place the GEE cross-check patch.
+        decoded_min, decoded_max, nodata_count = None, None, 0
+        band1 = None
+        for b in range(1, src.count + 1):
+            arr = src.read(b)
+            if b == 1:
+                band1 = arr
+                nodata_count = int((arr == NODATA).sum())
+            valid = arr[arr != NODATA]
+            if valid.size == 0:
+                continue
+            decoded = (valid.astype("float32") - OFFSET) / SCALE_FACTOR
+            lo, hi = float(decoded.min()), float(decoded.max())
+            decoded_min = lo if decoded_min is None else min(decoded_min, lo)
+            decoded_max = hi if decoded_max is None else max(decoded_max, hi)
+
+        range_ok = decoded_min is not None and decoded_min >= -1.01 and decoded_max <= 1.01
+        if decoded_min is None:
+            print("decoded range: every band came back all-nodata - can't check")
+        else:
+            print(f"decoded range across {src.count} bands: min {decoded_min:.4f} / max {decoded_max:.4f} (should sit in [-1, 1])")
+
+        nodata_frac = nodata_count / (src.width * src.height)
+        # nodata is legit for a coastal tile (ocean gets masked out) - this is
+        # informational, not a hard failure, judge it by eye against the tile
+        print(f"nodata fraction: {nodata_frac:.4f}")
+
+        nlcd_tifs = glob.glob("data/NLCD/*/*.tif")
+        aligned = None
+        if nlcd_tifs:
+            with rasterio.open(nlcd_tifs[0]) as nlcd:
+                dx = (src.transform.c - nlcd.transform.c) / NLCD_PIXEL_M
+                dy = (src.transform.f - nlcd.transform.f) / NLCD_PIXEL_M
+                aligned = abs(dx - round(dx)) < 1e-6 and abs(dy - round(dy)) < 1e-6
+                print(f"aligned to {nlcd_tifs[0]}: {aligned} (offset {dx:.6f}, {dy:.6f} px)")
+
+        print(f"\ncross-checking against fresh GEE recomputation ({VALIDATE_PATCH_PX}x{VALIDATE_PATCH_PX} patch, {VALIDATE_NUM_BANDS} bands)...")
+        init_ee()
+        grid = load_grid()
+        tile = load_tile_row(grid, args.tile_id)
+        fl_exact = florida_geometry()
+        minx, miny, maxx, maxy = tile.geometry.bounds
+
+        # Pick the window around actual land, not blindly the tile's
+        # geometric center - r039_c056 turned out to be ~70% ocean (ports
+        # like this sit right on the coast), and clipping a patch that falls
+        # entirely outside fl_exact throws "geometry for image clipping must
+        # be bounded" rather than just coming back empty. Center on whichever
+        # valid (non-nodata) pixel sits closest to the tile's middle instead.
+        half = VALIDATE_PATCH_PX // 2
+        if band1 is not None and (band1 != NODATA).any():
+            rows, cols = np.nonzero(band1 != NODATA)
+            mid = TILE_SIZE_PX_30M / 2
+            nearest = np.argmin((rows - mid) ** 2 + (cols - mid) ** 2)
+            center_row, center_col = int(rows[nearest]), int(cols[nearest])
+        else:
+            center_row = center_col = TILE_SIZE_PX_30M // 2
+        row_off = min(max(center_row - half, 0), TILE_SIZE_PX_30M - VALIDATE_PATCH_PX)
+        col_off = min(max(center_col - half, 0), TILE_SIZE_PX_30M - VALIDATE_PATCH_PX)
+        patch_minx = minx + col_off * NLCD_PIXEL_M
+        patch_maxy = maxy - row_off * NLCD_PIXEL_M
+        patch_bounds = (
+            patch_minx,
+            patch_maxy - VALIDATE_PATCH_PX * NLCD_PIXEL_M,
+            patch_minx + VALIDATE_PATCH_PX * NLCD_PIXEL_M,
+            patch_maxy,
+        )
+
+        # matches the real export's compute_region exactly (same tile
+        # bounds, same COMPUTE_BUFFER_M), so this isn't a different recipe -
+        # just the same one with a smaller getDownloadURL output window and
+        # fewer bands, since a sync getPixels call over the full 64 bands at
+        # tile-buffered resolution blows its "User memory limit" regardless
+        # of how small the requested output is (found by trying it).
+        img = year_tile_image_30m(args.year, tile.geometry.bounds, fl_exact).select(list(range(VALIDATE_NUM_BANDS)))
+        url = img.getDownloadURL(
+            {
+                "crs": NLCD_CRS_WKT,
+                "crsTransform": tile_transform(patch_bounds),
+                "dimensions": f"{VALIDATE_PATCH_PX}x{VALIDATE_PATCH_PX}",
+                "format": "GEO_TIFF",
+            }
+        )
+        os.makedirs(TEST_OUT_DIR, exist_ok=True)
+        patch_path = os.path.join(TEST_OUT_DIR, f"validate_{args.tile_id}_{args.year}_patch.tif")
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
+        with open(patch_path, "wb") as f:
+            f.write(resp.content)
+        print(f"wrote {patch_path} ({len(resp.content) / 1e6:.1f} MB)")
+
+        band_ids = list(range(1, VALIDATE_NUM_BANDS + 1))
+        local_patch = src.read(band_ids, window=Window(col_off, row_off, VALIDATE_PATCH_PX, VALIDATE_PATCH_PX))
+
+        # AlphaEarth granules are tiled ~163km on a side (see gee_common's
+        # year_native_projection docstring) - a tile can straddle a seam
+        # between two of them, and reduceResolution's reference grid comes
+        # from whichever granule year_native_projection's ee.first() happens
+        # to return, which isn't pinned to a particular one. A mismatch below
+        # for a multi-granule tile doesn't necessarily mean the exported file
+        # is wrong - it may just mean this rerun picked the other granule.
+        compute_region = ee.Geometry.Rectangle(
+            [minx - COMPUTE_BUFFER_M, miny - COMPUTE_BUFFER_M, maxx + COMPUTE_BUFFER_M, maxy + COMPUTE_BUFFER_M],
+            proj=NLCD_CRS_WKT,
+            evenOdd=False,
+        )
+        n_granules = year_collection(args.year, compute_region).size().getInfo()
+        if n_granules > 1:
+            print(f"note: {n_granules} AlphaEarth granules cover this tile - reduceResolution's reference grid isn't pinned to one of them, so an exact match isn't guaranteed even for a correct pipeline")
+
+    with rasterio.open(patch_path) as fresh:
+        fresh_patch = fresh.read()
+
+    # same deterministic recipe both sides (modulo the granule-seam caveat
+    # above), so this should be an exact match - anything else past that
+    # means the export or the download is stale
+    match = np.array_equal(local_patch, fresh_patch)
+    if match:
+        print(f"patch vs local file: PASS - byte-identical across {local_patch.shape[0]} bands")
+    else:
+        diff = np.abs(local_patch.astype(int) - fresh_patch.astype(int))
+        per_band_max = diff.max(axis=(1, 2))
+        worst = np.argsort(per_band_max)[::-1][:5]
+        print(f"patch vs local file: MISMATCH - {int((diff > 0).sum())} pixels differ")
+        for b in worst:
+            if per_band_max[b] > 0:
+                print(f"  band {b}: max abs diff {per_band_max[b]}")
+
+    failures = []
+    if not range_ok:
+        failures.append("decoded range outside [-1, 1]")
+    if aligned is False:
+        failures.append("not aligned to NLCD lattice")
+    if not match and n_granules <= 1:
+        failures.append("GEE cross-check mismatch")
+
+    if failures:
+        print(f"\nFAILED: {', '.join(failures)}")
+    elif not match:
+        print(f"\nINCONCLUSIVE: GEE cross-check mismatch, but {n_granules} granules cover this tile - see note above")
+    else:
+        print("\nVALID")
 
 
 def load_manifest():
@@ -451,6 +650,11 @@ def main():
     p_task = sub.add_parser("task")
     p_task.add_argument("task_id")
     p_task.set_defaults(func=cmd_task)
+
+    p_validate = sub.add_parser("validate-tile")
+    p_validate.add_argument("--tile-id", default=VALIDATE_DEFAULT_TILE_ID)
+    p_validate.add_argument("--year", type=int, default=VALIDATE_DEFAULT_YEAR)
+    p_validate.set_defaults(func=cmd_validate_tile)
 
     p_submit = sub.add_parser("submit")
     p_submit.add_argument("--years", type=int, nargs="+", default=[2017, 2018, 2019])
