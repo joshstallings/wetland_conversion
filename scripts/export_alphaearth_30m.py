@@ -251,7 +251,7 @@ def load_tile_row(grid, tile_id: str):
 def local_tile_path(tile_id: str, year: int) -> str:
     """Where a real (non-test) export lands locally once pulled from GCS -
     mirrors the `description` naming cmd_submit already uses."""
-    return f"data/AlphaEarth/AlphaEarth30m_Florida_{year}_{tile_id}.tif"
+    return f"data/AlphaEarth/alphaearth_florida_30m/AlphaEarth30m_Florida_{year}_{tile_id}.tif"
 
 
 def cmd_test_tile(args):

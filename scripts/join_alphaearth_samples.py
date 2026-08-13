@@ -57,6 +57,14 @@ JOINED_DIR = "data/processed/alphaearth_wetland_joined"
 
 TILE_SIZE_M = TILE_SIZE_PX_30M * NLCD_PIXEL_M  # 60km - matches build_florida_tile_grid_30m.py
 
+# ~10km spatial-CV blocks - big enough to break the spatial autocorrelation
+# between neighboring wetland pixels that a plain random split would leak
+# across train/test, small enough not to fragment Florida into a handful of
+# giant blocks. Unlike TILE_SIZE_M this doesn't need to land on a whole pixel
+# count (10000/30 isn't one) - blocks just need a consistent partition, not a
+# raster to export.
+BLOCK_SIZE_M = 10_000
+
 BAND_COLS = [f"A{b:02d}" for b in range(64)]
 
 # lc_2019/lc_2024/dist_to_developed_2024_m describe the post-2019 outcome, not
@@ -103,11 +111,26 @@ def samples_for_tile(samples: pd.DataFrame, tile_id: str) -> pd.DataFrame:
     return samples[(samples["_grid_row"] == row) & (samples["_grid_col"] == col)]
 
 
+def add_block_id(df: pd.DataFrame) -> pd.DataFrame:
+    """Stamps a ~10km spatial block id onto df (needs x/y columns), for
+    holding out whole blocks under spatial cross-validation rather than
+    letting a random split put neighboring, highly-correlated pixels on
+    both sides of the train/test boundary. Computed off the same absolute
+    NLCD-grid origin the 60km tile grid uses, not tile-relative - so a block
+    that happens to straddle two AlphaEarth tiles still gets the identical
+    block_id in both tiles' output files, and grouping by block_id later
+    across the whole joined output directory unions correctly."""
+    block_row = np.floor((NLCD_ORIGIN_Y - df["y"].to_numpy(dtype="float64")) / BLOCK_SIZE_M).astype(np.int32)
+    block_col = np.floor((df["x"].to_numpy(dtype="float64") - NLCD_ORIGIN_X) / BLOCK_SIZE_M).astype(np.int32)
+    df["block_id"] = [f"b{r:04d}_{c:04d}" for r, c in zip(block_row, block_col)]
+    return df
+
+
 def local_tile_years() -> list[tuple[str, int]]:
     """(tile_id, year) for every real (non-test) tile-year tif actually on
     disk right now."""
     found = []
-    for path in glob.glob("data/AlphaEarth/AlphaEarth30m_Florida_*_r*_c*.tif"):
+    for path in glob.glob("data/AlphaEarth/alphaearth_florida_30m/AlphaEarth30m_Florida_*_r*_c*.tif"):
         m = TILE_TIF_RE.search(os.path.basename(path))
         if m:
             found.append((m.group(2), int(m.group(1))))
@@ -227,6 +250,8 @@ def cmd_assemble(args):
                 year_cols = ["row", "col"] + [f"{b}_{year}" for b in BAND_COLS]
                 merged = merged.merge(df[year_cols], on=["row", "col"], how="inner")
 
+        assert merged is not None  # args.years is nargs="+", so the loop above always runs at least once
+        merged = add_block_id(merged)
         merged.to_parquet(out_path, index=False)
         print(f"  {tile_id}: wrote {out_path} ({len(merged)} rows)")
         n_done += 1

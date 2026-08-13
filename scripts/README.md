@@ -36,6 +36,9 @@ alongside the label columns. `extract-tile`/`extract-all` pull decoded band
 values per (tile, year) into `data/processed/alphaearth_extract/`; `assemble`
 inner-joins a tile's extracted years into
 `data/processed/alphaearth_wetland_joined/{tile_id}.parquet` once all of them
-are done. Both stages skip whatever's already on disk, so re-running
-`extract-all` then `assemble` as more tiles finish downloading just picks up
-the new ones - `status` shows tif/extract/assemble progress per tile.
+are done, stamping each row with a `block_id` (~10km grid cell, absolute
+origin so it's consistent across tile files) for spatial block
+cross-validation later. Both stages skip whatever's already on disk, so
+re-running `extract-all` then `assemble` as more tiles finish downloading
+just picks up the new ones - `status` shows tif/extract/assemble progress per
+tile.
