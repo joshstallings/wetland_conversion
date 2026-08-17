@@ -42,3 +42,25 @@ cross-validation later. Both stages skip whatever's already on disk, so
 re-running `extract-all` then `assemble` as more tiles finish downloading
 just picks up the new ones - `status` shows tif/extract/assemble progress per
 tile.
+
+## build_train_pool.py
+
+Turns the joined table into the 5 spatial folds and the weighted training pool
+`gradient_boosting.ipynb` fits against. `folds` assigns the 1,727 10km blocks,
+balancing block count, the label=1 and label=2 counts, and total rows all at
+once (greedy pass, then pairwise swaps), and writes
+`data/processed/block_folds.parquet`. `pool` keeps every label=1 and label=2
+pixel, label=1 twice over, thins label=0 with a keep rate that decays with
+distance to 2019 development, and writes
+`data/processed/gb_train_pool.parquet`. Each fold gets its own decay constant
+solved in closed form so all five contribute the same row budget. `report`
+prints and saves the per fold counts, weights and distance quantiles to
+`results/folds/`.
+
+Both stages are deterministic, so a rebuild reproduces the same split and the
+same draw. That depends on two things worth not undoing: the block aggregate is
+sorted before the seeded shuffle, and the draw is keyed on `hash(row, col)`
+rather than `random()`, which duckdb does not reproduce across thread counts.
+Rerun both with `--force` after changing any sampling constant, since a pool
+left over from an older fold assignment stays loadable and would quietly train
+on the wrong split.
