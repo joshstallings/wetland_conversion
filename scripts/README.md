@@ -75,6 +75,40 @@ reproduce across thread counts. Rerun with `--force` to overwrite a dataset
 under the same name; otherwise pick a new `--dataset-name` and the old one
 stays untouched.
 
+A third subcommand, `features`, builds a shared cache of neighborhood
+features straight from the 2019 NLCD raster: local development density at
+100m/300m/500m, edge density at 300m, and direction to the nearest
+developed pixel, encoded as sine and cosine. Not tied to a dataset name,
+one row per wetland sample pixel, written once to
+`data/processed/neighborhood_features.parquet` and required before
+`gb_common.py` will connect to anything. Pass `--with-neighborhood-features`
+to `pool` to carry those columns into a dataset's `gb_train_pool.parquet`
+too. See `PLAN.md` for how each feature is built and why.
+
+## block_distance_profiles.py
+
+Groups the 1,727 10km blocks by the shape of their distance to development
+distribution. Diagnostic only, nothing here feeds the folds, the pool or the
+feature set. `profiles` reduces each block to the quantile function of its
+pixels' `dist_to_developed_2019_m`, sampled at 39 knots, and writes
+`data/processed/block_distance_profiles.parquet`. Quantile functions rather
+than histograms because euclidean distance between two of them is the
+2-Wasserstein distance between the distributions, so the k-means in `cluster`
+is Wasserstein k-means and its centroids plot back as ECDFs. `cluster` runs
+the k sweep, a resampling stability check, and the fit, then writes
+`block_distance_clusters.parquet`. `report` prints per cluster conversion
+rates and quantiles, and crosstabs clusters against a dataset's folds if you
+pass `--dataset-name`.
+
+At k=4 the regimes run from a median of 110m to 7,725m from development, and
+conversion to developed falls monotonically across them from 2.19% to 0.006%
+while conversion to other, not developed cover stays flat near 0.4%. The
+clustering is mostly a rebinning of median distance and says so: `cluster`
+prints the level/shape variance split and the ARI against clustering on the
+median alone. `--shape-only` strips each block's own median first, which is
+what isolates the rest. `eda_dataset.ipynb` reads the two output tables in its
+"Block distance regimes" section and builds the figures.
+
 ## gb_common.py
 
 Shared config and helpers for the modeling half: feature and target column

@@ -13,7 +13,10 @@ on its own once the one before it exists.
    pull Google AlphaEarth embeddings and join them onto the labels.
 3. `scripts/build_train_pool.py` builds a named, versioned dataset: a spatial
    fold assignment and a weighted training pool, under
-   `data/processed/datasets/<name>/`.
+   `data/processed/datasets/<name>/`. Its `features` subcommand also builds a
+   shared cache of neighborhood features straight from the 2019 NLCD raster
+   (local development density, edge density, direction to development), see
+   `PLAN.md` for what each one is and why.
 4. `eda_dataset.ipynb` explores the joined table and any one built dataset.
 5. `scripts/gb_train.py` fits and persists gradient boosting models for a named
    experiment (`scripts/experiments.py`), under `results/models/<name>/`.

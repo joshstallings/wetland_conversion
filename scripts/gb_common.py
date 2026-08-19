@@ -17,6 +17,17 @@ from sklearn.isotonic import IsotonicRegression
 JOINED_GLOB = "data/processed/alphaearth_wetland_joined/*.parquet"
 DATASETS_DIR = "data/processed/datasets"
 
+# Built once by `python scripts/build_train_pool.py features`, not tied to
+# any one dataset: the local development density, edge density, and
+# direction-to-nearest-development columns, one row per wetland sample
+# pixel. connect_raw() joins this onto `samples` unconditionally, same as
+# the AlphaEarth bands, so it needs to exist before anything in this module
+# runs. See PLAN.md for how each column is built.
+NEIGHBORHOOD_FEATURES_PATH = "data/processed/neighborhood_features.parquet"
+NEIGHBORHOOD_FEATURE_COLS = [
+    "frac_dev_100m", "frac_dev_300m", "frac_dev_500m", "edge_density_300m", "dev_dir_sin", "dev_dir_cos",
+]
+
 K_FOLDS = 5
 DIST_COL = "dist_to_developed_2019_m"
 DIST_NORM_COL = "dist_log_z"
@@ -24,6 +35,11 @@ TARGET_COL = "label_bin"
 BAND_COLS = [f"A{b:02d}_{year}" for year in (2017, 2018, 2019) for b in range(64)]
 FEATURE_COLS = [DIST_NORM_COL] + BAND_COLS
 DIST_ONLY_FEATURE_COLS = [DIST_NORM_COL]
+# Distance, the neighborhood features, and every AlphaEarth band together.
+EXTENDED_FEATURE_COLS = [DIST_NORM_COL] + NEIGHBORHOOD_FEATURE_COLS + BAND_COLS
+# Distance and the neighborhood features, no AlphaEarth bands: isolates what
+# the raster derived features add on their own, without embeddings in the mix.
+DIST_PLUS_NEIGHBORHOOD_FEATURE_COLS = [DIST_NORM_COL] + NEIGHBORHOOD_FEATURE_COLS
 
 M2_PER_ACRE = 4046.8564224
 PIXEL_ACRES = 30 * 30 / M2_PER_ACRE  # one 30m NLCD pixel, in acres
@@ -51,6 +67,13 @@ LABEL_COLORS = {
     "Converted to developed": "#eb6834",
 }
 
+# Okabe-Ito, for the block distance clusters in eda_dataset.ipynb. Clusters
+# are numbered by centroid distance, so index 0 is the regime closest to
+# development and the ramp reads roughly near to far.
+CLUSTER_COLORS = [
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#666666",
+]
+
 
 def dataset_dir(dataset_name: str) -> str:
     return os.path.join(DATASETS_DIR, dataset_name)
@@ -66,10 +89,20 @@ def load_dataset_config(dataset_name: str) -> dict:
 
 
 def connect_raw() -> duckdb.DuckDBPyConnection:
-    """Open a connection with just the `samples` view, the full joined table,
-    no fold join. For EDA that doesn't depend on any one generated dataset."""
+    """Open a connection with just the `samples` view, the full joined table
+    plus the neighborhood features, no fold join. For EDA that doesn't
+    depend on any one generated dataset."""
+    if not os.path.exists(NEIGHBORHOOD_FEATURES_PATH):
+        raise SystemExit(f"{NEIGHBORHOOD_FEATURES_PATH} not found, run "
+                         f"`python scripts/build_train_pool.py features` first")
     con = duckdb.connect()
-    con.execute(f"CREATE OR REPLACE VIEW samples AS SELECT * FROM read_parquet('{JOINED_GLOB}')")
+    con.execute(f"""
+        CREATE OR REPLACE VIEW samples AS
+        SELECT s.*, nf.* EXCLUDE ("row", "col")
+        FROM read_parquet('{JOINED_GLOB}') s
+        LEFT JOIN read_parquet('{NEIGHBORHOOD_FEATURES_PATH}') nf
+            ON s."row" = nf."row" AND s."col" = nf."col"
+    """)
     return con
 
 
@@ -171,7 +204,7 @@ def predict_fold(con: duckdb.DuckDBPyConnection, model, fold_id: int, log_mean: 
     fold in memory at once. Returns (y_true, y_score)."""
     feature_cols = feature_cols or FEATURE_COLS
     reader = con.execute(f"""
-        SELECT {DIST_COL}, {", ".join(BAND_COLS)},
+        SELECT {DIST_COL}, {", ".join(BAND_COLS)}, {", ".join(NEIGHBORHOOD_FEATURE_COLS)},
                CASE WHEN label = 1 THEN 1 ELSE 0 END AS {TARGET_COL}
         FROM samples_fold
         WHERE fold = {fold_id}
@@ -192,7 +225,7 @@ def predict_fold_with_dist(con: duckdb.DuckDBPyConnection, model, fold_id: int, 
     the decile breakdown in model_analysis.ipynb."""
     feature_cols = feature_cols or FEATURE_COLS
     reader = con.execute(f"""
-        SELECT {DIST_COL}, {", ".join(BAND_COLS)},
+        SELECT {DIST_COL}, {", ".join(BAND_COLS)}, {", ".join(NEIGHBORHOOD_FEATURE_COLS)},
                CASE WHEN label = 1 THEN 1 ELSE 0 END AS {TARGET_COL}
         FROM samples_fold
         WHERE fold = {fold_id}
@@ -220,7 +253,7 @@ def natural_fold_sample(con: duckdb.DuckDBPyConnection, fold_id: int, n_rows: in
     n_fold = con.execute(f"SELECT COUNT(*) FROM samples_fold WHERE fold = {fold_id}").fetchone()[0]
     frac = min(1.0, n_rows / n_fold)
     df = con.execute(f"""
-        SELECT {DIST_COL}, {", ".join(BAND_COLS)},
+        SELECT {DIST_COL}, {", ".join(BAND_COLS)}, {", ".join(NEIGHBORHOOD_FEATURE_COLS)},
                CASE WHEN label = 1 THEN 1 ELSE 0 END AS {TARGET_COL}
         FROM samples_fold
         WHERE fold = {fold_id}
@@ -242,7 +275,7 @@ def sample_fold_with_xy(con: duckdb.DuckDBPyConnection, fold_id: int, n_rows: in
     n_fold = con.execute(f"SELECT COUNT(*) FROM samples_fold WHERE fold = {fold_id}").fetchone()[0]
     frac = min(1.0, n_rows / n_fold)
     df = con.execute(f"""
-        SELECT x, y, label, {DIST_COL}, {", ".join(BAND_COLS)}
+        SELECT x, y, label, {DIST_COL}, {", ".join(BAND_COLS)}, {", ".join(NEIGHBORHOOD_FEATURE_COLS)}
         FROM samples_fold
         WHERE fold = {fold_id}
           AND (hash("row", "col", 21) % 1073741824) / 1073741824.0 < {frac}
@@ -256,11 +289,14 @@ def iter_folds(con: duckdb.DuckDBPyConnection, train_pool: pd.DataFrame,
                pos_weight_mult: float, pos_row_dup: int, k: int = K_FOLDS):
     """Yield (fold_id, X_train, y_train, w_train, predict_test, make_calibrator).
 
-    X_train always carries the full FEATURE_COLS, callers restrict to a
-    smaller set (see DIST_ONLY_FEATURE_COLS) by slicing before fit, same for
-    predict_test/make_calibrator's feature_cols argument. Nothing about the
-    fold split, the weighting, or the nested calibration split depends on
-    which columns end up in front of the model.
+    X_train carries every column train_pool has, not just FEATURE_COLS,
+    since a dataset built with --with-neighborhood-features carries columns
+    beyond that fixed list. Callers slice down to whatever their experiment
+    actually wants (see DIST_ONLY_FEATURE_COLS, EXTENDED_FEATURE_COLS)
+    before fit, same for predict_test/make_calibrator's feature_cols
+    argument. Nothing about the fold split, the weighting, or the nested
+    calibration split depends on which columns end up in front of the
+    model.
 
     predict_test(model, feature_cols=None) streams the held out fold and
     hands back (y_true, y_score), so no caller ever holds the full test frame
@@ -295,6 +331,6 @@ def iter_folds(con: duckdb.DuckDBPyConnection, train_pool: pd.DataFrame,
 
         yield (
             fold_id,
-            train_fold[FEATURE_COLS], train_fold[TARGET_COL], w_train,
+            train_fold, train_fold[TARGET_COL], w_train,
             predict_test, make_calibrator,
         )

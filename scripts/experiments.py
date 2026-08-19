@@ -9,7 +9,7 @@ naming a run is that the name always means the same thing.
 
 from dataclasses import dataclass, field
 
-from gb_common import DIST_ONLY_FEATURE_COLS, FEATURE_COLS
+from gb_common import DIST_ONLY_FEATURE_COLS, DIST_PLUS_NEIGHBORHOOD_FEATURE_COLS, EXTENDED_FEATURE_COLS, FEATURE_COLS
 
 # Same 32 combination grid gradient_boosting.ipynb screened, kept as a shared
 # constant so experiments meant to be compared use the exact same grid rather
@@ -54,6 +54,30 @@ EXPERIMENTS = {
         # anyway so this experiment's grid results line up column for column
         # against full-features
         grid=_STANDARD_GRID,
+    ),
+    "neighborhood-features": ExperimentConfig(
+        # results/models/Experiment3-neighborhood-features/, renamed by hand
+        # to match the ExperimentN-Name directories the original notebook
+        # left behind (Experiment0-Initial etc); the dict key below is the
+        # short name gb_train.py --experiment still takes on the CLI
+        experiment_name="Experiment3-neighborhood-features",
+        # built with `folds`/`pool --with-neighborhood-features` under this
+        # name, see PLAN.md for what the six extra columns are and how
+        # they're built
+        dataset_name="neighborhood-v1",
+        feature_cols=EXTENDED_FEATURE_COLS,
+        # baseline only, no grid configured
+    ),
+    "neighborhood-features-distance-only": ExperimentConfig(
+        # results/models/Experiment3b-neighborhood-features-distance-only/,
+        # 3b since it is a variant on Experiment3, same dataset and neighborhood
+        # features, with the 192 AlphaEarth bands dropped, to see what the
+        # distance and neighborhood columns alone are worth without embeddings
+        # to lean on
+        experiment_name="Experiment3b-neighborhood-features-distance-only",
+        dataset_name="neighborhood-v1",
+        feature_cols=DIST_PLUS_NEIGHBORHOOD_FEATURE_COLS,
+        # baseline only, no grid configured
     ),
 }
 

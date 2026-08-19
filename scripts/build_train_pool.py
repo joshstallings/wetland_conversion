@@ -25,7 +25,21 @@ reproduces the same split and the same draw:
       same row budget no matter where its distance distribution happens to
       sit. Requires a fold assignment already built under the same
       dataset-name. Writes
-      data/processed/datasets/<dataset-name>/gb_train_pool.parquet.
+      data/processed/datasets/<dataset-name>/gb_train_pool.parquet. Pass
+      --with-neighborhood-features to add the columns `features` below
+      builds to the draw.
+
+  features
+      Builds neighborhood features straight from the 2019 NLCD raster: the
+      share of nearby pixels already developed at 100m/300m/500m, a local
+      density of developed/not developed edges at 300m, and the direction
+      (as sine and cosine) toward the nearest developed pixel. Not tied to
+      any one dataset-name, these are fixed properties of a pixel's
+      surroundings, the same for every dataset built from the same raster.
+      Writes data/processed/neighborhood_features.parquet, one row per
+      wetland sample pixel. See PLAN.md for the reasoning behind each
+      feature and the approximations made to keep this affordable on a
+      668 million pixel raster.
 
 Every constant a dataset was actually built with, defaulted or overridden,
 gets written to data/processed/datasets/<dataset-name>/config.json, so the
@@ -42,24 +56,49 @@ calibrate() applies that correction before anything gets reported in
 probability units.
 
 Usage:
+    python scripts/build_train_pool.py features [--force]
     python scripts/build_train_pool.py folds --dataset-name NAME [--force]
         [--k-folds 5] [--seed 0]
     python scripts/build_train_pool.py pool --dataset-name NAME [--force]
         [--tau-m 200.0] [--pos-row-dup 2] [--pos-weight-mult 10.0]
         [--rows-per-training-set 2500000] [--draw-seed 42]
+        [--with-neighborhood-features]
     python scripts/build_train_pool.py report --dataset-name NAME
 """
 
 import argparse
+import gc
 import json
 import os
 
 import duckdb
+import geopandas as gpd
 import numpy as np
 import pandas as pd
+import rasterio
+from rasterio.windows import transform as window_transform
+from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt, uniform_filter
 
 JOINED_GLOB = "data/processed/alphaearth_wetland_joined/*.parquet"
 DATASETS_DIR = "data/processed/datasets"
+
+# Inputs for the features command. Kept separate from the rest of this
+# file's constants since nothing else here touches the raw NLCD raster.
+NLCD_2019_PATH = "data/NLCD/Annual_NLCD_LndCov_2019_CU_C1V2/Annual_NLCD_LndCov_2019_CU_C1V2.tif"
+STATE_BOUNDARY_SHP = "data/boundaries/cb_2023_us_state_500k/cb_2023_us_state_500k.shp"
+SAMPLE_LABELS_PATH = "data/processed/wetland_sample_labels_2019_2024.parquet"
+NEIGHBORHOOD_FEATURES_PATH = "data/processed/neighborhood_features.parquet"
+
+# Same buffer wetland_sample_labels.ipynb reads the 2019 raster with. Has to
+# match exactly, this is what keeps a row, col pair pointing at the same
+# pixel here as it does in the sample table.
+BUFFER_M = 15_000
+DEVELOPED_CLASSES = (21, 22, 23, 24)
+PIXEL_M = 30.0
+
+NEIGHBORHOOD_RADII_M = {"frac_dev_100m": 100.0, "frac_dev_300m": 300.0, "frac_dev_500m": 500.0}
+EDGE_DENSITY_RADIUS_M = 300.0
+NEIGHBORHOOD_FEATURE_COLS = list(NEIGHBORHOOD_RADII_M) + ["edge_density_300m", "dev_dir_sin", "dev_dir_cos"]
 
 K_FOLDS = 5
 
@@ -138,9 +177,20 @@ def save_config(dataset_name: str, updates: dict) -> None:
         json.dump(cfg, f, indent=2, sort_keys=True)
 
 
-def connect() -> duckdb.DuckDBPyConnection:
+def connect(with_neighborhood_features: bool = False) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    con.execute(f"CREATE OR REPLACE VIEW samples AS SELECT * FROM read_parquet('{JOINED_GLOB}')")
+    if with_neighborhood_features:
+        if not os.path.exists(NEIGHBORHOOD_FEATURES_PATH):
+            raise SystemExit(f"{NEIGHBORHOOD_FEATURES_PATH} not found, run `build_train_pool.py features` first")
+        con.execute(f"""
+            CREATE OR REPLACE VIEW samples AS
+            SELECT s.*, nf.* EXCLUDE ("row", "col")
+            FROM read_parquet('{JOINED_GLOB}') s
+            LEFT JOIN read_parquet('{NEIGHBORHOOD_FEATURES_PATH}') nf
+                ON s."row" = nf."row" AND s."col" = nf."col"
+        """)
+    else:
+        con.execute(f"CREATE OR REPLACE VIEW samples AS SELECT * FROM read_parquet('{JOINED_GLOB}')")
     return con
 
 
@@ -327,7 +377,7 @@ def cmd_pool(args):
     k_folds = cfg["k_folds"]
     rows_per_fold = args.rows_per_training_set // (k_folds - 1)
 
-    con = connect()
+    con = connect(with_neighborhood_features=args.with_neighborhood_features)
     attach_folds(con, block_folds_path)
 
     calib = fold_calibration(con, args.tau_m, P_FLOOR, args.pos_row_dup, rows_per_fold)
@@ -337,6 +387,8 @@ def cmd_pool(args):
     pos_weight = args.pos_weight_mult / args.pos_row_dup
     bands = ", ".join(BAND_COLS)
     carried = f'"row", "col", block_id, fold, x, y, {DIST_COL}, label, label_bin, p_include, sample_weight'
+    if args.with_neighborhood_features:
+        carried += ", " + ", ".join(NEIGHBORHOOD_FEATURE_COLS)
 
     # random() is not reproducible across thread counts, so the draw hangs off a
     # hash of the pixel key instead. (row, col) is unique statewide.
@@ -390,7 +442,119 @@ def cmd_pool(args):
         "rows_per_training_set": args.rows_per_training_set,
         "rows_per_fold": rows_per_fold,
         "draw_seed": args.draw_seed,
+        "with_neighborhood_features": args.with_neighborhood_features,
     })
+
+
+def florida_window():
+    """Reproduces wetland_sample_labels.ipynb's exact window over the 2019
+    NLCD raster: Florida's bounding box plus a 15km buffer. Has to match
+    that notebook exactly, since that is what keeps a row, col pair here
+    pointing at the same pixel it points at in the sample table. Returns
+    the rasterio Window and its affine transform."""
+    us_states = gpd.read_file(STATE_BOUNDARY_SHP)
+    florida = us_states.loc[us_states["NAME"] == "Florida"]
+    with rasterio.open(NLCD_2019_PATH) as src:
+        florida_proj = florida.to_crs(src.crs)
+        florida_geom = florida_proj.geometry.union_all()
+        minx, miny, maxx, maxy = florida_geom.bounds
+        buffered_bounds = (minx - BUFFER_M, miny - BUFFER_M, maxx + BUFFER_M, maxy + BUFFER_M)
+        window = src.window(*buffered_bounds).round_offsets(op="floor").round_lengths(op="ceil")
+        win_transform = window_transform(window, src.transform)
+    return window, win_transform
+
+
+def _local_density(mask: np.ndarray, radius_m: float) -> np.ndarray:
+    """Share of True pixels in a square neighborhood approximating the
+    requested radius. A square box filter, not a true circle: uniform_filter
+    is a couple of cheap passes over the array, while an exact circular
+    average would need a slower convolution, and at this pixel count that
+    cost is not worth it for what is still just a proxy feature. Box side is
+    the requested radius rounded to the nearest whole 30m pixel, doubled."""
+    r_px = max(1, round(radius_m / PIXEL_M))
+    return uniform_filter(mask.astype(np.float32), size=2 * r_px + 1, mode="nearest")
+
+
+def _edge_mask(developed: np.ndarray) -> np.ndarray:
+    """Pixels sitting on the boundary between developed and not developed
+    land: present in a slightly grown version of the mask but not in a
+    slightly shrunk one, the standard morphological way to find edges."""
+    return binary_dilation(developed) & ~binary_erosion(developed)
+
+
+def _direction_to_nearest_developed(developed: np.ndarray, win_transform,
+                                    rows: np.ndarray, cols: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Sine and cosine of the compass bearing from each sample pixel toward
+    the nearest 2019 developed pixel. A raw angle is a bad feature here.
+    359 degrees and 1 degree point almost the same direction but look
+    nothing alike as numbers, sine and cosine avoid that wraparound.
+
+    Only the location of the nearest developed pixel is needed, the
+    distance itself already exists as dist_to_developed_2019_m, so
+    return_distances is turned off, which skips building a second array the
+    size of the whole window that nothing here would use.
+    """
+    indices = distance_transform_edt(
+        ~developed, sampling=(PIXEL_M, PIXEL_M), return_distances=False, return_indices=True,
+    )
+    nearest_row = indices[0][rows, cols]
+    nearest_col = indices[1][rows, cols]
+    del indices
+    gc.collect()
+
+    dx_m = (nearest_col.astype(np.float64) - cols) * win_transform.a
+    dy_m = (nearest_row.astype(np.float64) - rows) * win_transform.e
+    theta = np.arctan2(dy_m, dx_m)
+    return np.sin(theta).astype(np.float32), np.cos(theta).astype(np.float32)
+
+
+def cmd_features(args):
+    if os.path.exists(NEIGHBORHOOD_FEATURES_PATH) and not args.force:
+        print(f"{NEIGHBORHOOD_FEATURES_PATH} exists, use --force to rebuild")
+        return
+
+    sample = pd.read_parquet(SAMPLE_LABELS_PATH, columns=["row", "col"])
+    rows = sample["row"].to_numpy()
+    cols = sample["col"].to_numpy()
+    print(f"{len(sample):,} sample pixels, reading the 2019 NLCD window...")
+
+    window, win_transform = florida_window()
+    with rasterio.open(NLCD_2019_PATH) as src:
+        lc_2019 = src.read(1, window=window)
+    print(f"window shape {lc_2019.shape}, {lc_2019.size:,} pixels")
+
+    # unclipped to Florida, same as dist_to_developed_2019_m: development
+    # just across the state line still counts, which is the whole point of
+    # BUFFER_M
+    developed = np.isin(lc_2019, DEVELOPED_CLASSES)
+    del lc_2019
+    gc.collect()
+
+    out = {"row": rows.astype(np.int32), "col": cols.astype(np.int32)}
+
+    for col_name, radius_m in NEIGHBORHOOD_RADII_M.items():
+        print(f"  {col_name} ...")
+        density = _local_density(developed, radius_m)
+        out[col_name] = density[rows, cols].astype(np.float32)
+        del density
+        gc.collect()
+
+    print("  edge_density_300m ...")
+    edges = _edge_mask(developed)
+    edge_density = _local_density(edges, EDGE_DENSITY_RADIUS_M)
+    out["edge_density_300m"] = edge_density[rows, cols].astype(np.float32)
+    del edges, edge_density
+    gc.collect()
+
+    print("  dev_dir_sin, dev_dir_cos ...")
+    out["dev_dir_sin"], out["dev_dir_cos"] = _direction_to_nearest_developed(developed, win_transform, rows, cols)
+    del developed
+    gc.collect()
+
+    os.makedirs(os.path.dirname(NEIGHBORHOOD_FEATURES_PATH), exist_ok=True)
+    pd.DataFrame(out).to_parquet(NEIGHBORHOOD_FEATURES_PATH, index=False)
+    print(f"wrote {NEIGHBORHOOD_FEATURES_PATH} ({len(sample):,} rows, "
+          f"{len(NEIGHBORHOOD_FEATURE_COLS)} feature columns)")
 
 
 def _quantiles(con, table: str, where: str, tag: str) -> pd.DataFrame:
@@ -468,6 +632,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    p_ft = sub.add_parser("features")
+    p_ft.add_argument("--force", action="store_true")
+    p_ft.set_defaults(func=cmd_features)
+
     p_f = sub.add_parser("folds")
     p_f.add_argument("--dataset-name", required=True)
     p_f.add_argument("--force", action="store_true")
@@ -483,6 +651,7 @@ def main():
     p_p.add_argument("--pos-weight-mult", type=float, default=POS_WEIGHT_MULT)
     p_p.add_argument("--rows-per-training-set", type=int, default=ROWS_PER_TRAINING_SET)
     p_p.add_argument("--draw-seed", type=int, default=DRAW_SEED)
+    p_p.add_argument("--with-neighborhood-features", action="store_true")
     p_p.set_defaults(func=cmd_pool)
 
     p_r = sub.add_parser("report")
