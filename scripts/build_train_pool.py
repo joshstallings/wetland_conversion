@@ -1,43 +1,57 @@
 """Build the 5 spatial folds and the gradient boosting training pool from the
-joined AlphaEarth/NLCD table.
-
-Two stages, both deterministic, so a rerun reproduces the same split and the same
-draw:
+joined AlphaEarth/NLCD table. Every run is named: output goes to
+data/processed/datasets/<dataset-name>/, so tuning a sampling constant and
+rerunning under a new name never touches a dataset you already trained
+against. Two stages, both deterministic, so a rerun of the same name
+reproduces the same split and the same draw:
 
   folds
-      Assigns the 1,727 10km blocks to 5 folds, balancing three things at once:
-      block count, rare class counts, and total row count. Balancing on label=1
-      alone (what gradient_boosting.ipynb used to do inline) got the positive
-      counts exact but left folds 0 and 3 holding twice the rows of the others,
-      so test fold prevalence swung from 0.19% to 0.43% and the per fold AP
-      numbers were not comparable to each other. A greedy pass gets it roughly
-      right, then pairwise swaps between folds close the rest of the gap.
-      Writes data/processed/block_folds.parquet.
+      Assigns the 1,727 10km blocks to K_FOLDS folds, balancing three things
+      at once: block count, rare class counts, and total row count. Balancing
+      on label=1 alone (what gradient_boosting.ipynb used to do inline) got
+      the positive counts exact but left folds 0 and 3 holding twice the rows
+      of the others, so test fold prevalence swung from 0.19% to 0.43% and
+      the per fold AP numbers were not comparable to each other. A greedy
+      pass gets it roughly right, then pairwise swaps between folds close the
+      rest of the gap. Writes
+      data/processed/datasets/<dataset-name>/block_folds.parquet.
 
   pool
-      Draws the training pool. Every label=1 and label=2 pixel is kept, label=1
-      twice over, and label=0 is kept with a probability that decays with
-      distance to 2019 development so the pool concentrates where conversion
-      actually happens. Each fold gets its own decay constant A_k, solved in
-      closed form so every fold contributes the same row budget no matter where
-      its distance distribution happens to sit. Writes
-      data/processed/gb_train_pool.parquet.
+      Draws the training pool. Every label=1 and label=2 pixel is kept,
+      label=1 duplicated pos-row-dup times over, and label=0 is kept with a
+      probability that decays with distance to 2019 development so the pool
+      concentrates where conversion actually happens. Each fold gets its own
+      decay constant A_k, solved in closed form so every fold contributes the
+      same row budget no matter where its distance distribution happens to
+      sit. Requires a fold assignment already built under the same
+      dataset-name. Writes
+      data/processed/datasets/<dataset-name>/gb_train_pool.parquet.
 
-On weighting: label=0 rows carry 1/p, so in expectation they reconstruct the true
-label=0 population, and label=2 sits at p=1 and weight 1, so it represents
-exactly itself. That leaves the deliberate POS_WEIGHT_MULT boost on label=1 as
-the only place the pool departs from reality, which is what makes the model's
-scores recoverable back to real conversion probabilities with
-p_true = p / (p + POS_WEIGHT_MULT * (1 - p)). gradient_boosting.ipynb applies
-that correction before it reports anything in probability units.
+Every constant a dataset was actually built with, defaulted or overridden,
+gets written to data/processed/datasets/<dataset-name>/config.json, so the
+directory is self documenting: no need to cross reference a notebook cell or
+shell history to know what produced it.
+
+On weighting: label=0 rows carry 1/p, so in expectation they reconstruct the
+true label=0 population, and label=2 sits at p=1 and weight 1, so it
+represents exactly itself. That leaves the deliberate pos-weight-mult boost
+on label=1 as the only place the pool departs from reality, which is what
+makes the model's scores recoverable back to real conversion probabilities
+with p_true = p / (p + pos_weight_mult * (1 - p)). scripts/gb_common.py's
+calibrate() applies that correction before anything gets reported in
+probability units.
 
 Usage:
-    python scripts/build_train_pool.py folds [--force]
-    python scripts/build_train_pool.py pool [--force]
-    python scripts/build_train_pool.py report
+    python scripts/build_train_pool.py folds --dataset-name NAME [--force]
+        [--k-folds 5] [--seed 0]
+    python scripts/build_train_pool.py pool --dataset-name NAME [--force]
+        [--tau-m 200.0] [--pos-row-dup 2] [--pos-weight-mult 10.0]
+        [--rows-per-training-set 2500000] [--draw-seed 42]
+    python scripts/build_train_pool.py report --dataset-name NAME
 """
 
 import argparse
+import json
 import os
 
 import duckdb
@@ -45,31 +59,32 @@ import numpy as np
 import pandas as pd
 
 JOINED_GLOB = "data/processed/alphaearth_wetland_joined/*.parquet"
-BLOCK_FOLDS_PATH = "data/processed/block_folds.parquet"
-TRAIN_POOL_PATH = "data/processed/gb_train_pool.parquet"
-FOLD_REPORT_DIR = "results/folds"
+DATASETS_DIR = "data/processed/datasets"
 
 K_FOLDS = 5
 
-# 2.5M rows in front of the model per CV iteration. Each iteration trains on
-# K_FOLDS - 1 folds, so this is what each fold has to contribute.
+# 2.5M rows in front of the model per CV iteration, the default. Each
+# iteration trains on k_folds - 1 folds, so rows_per_fold is what each fold
+# has to contribute: rows_per_training_set // (k_folds - 1).
 ROWS_PER_TRAINING_SET = 2_500_000
-ROWS_PER_FOLD = ROWS_PER_TRAINING_SET // (K_FOLDS - 1)
 
 # Negative keep rate is P_FLOOR + A_k * exp(-dist / TAU_M). 200m is picked off
 # the label=1 distance profile: converters sit at a median of 30 to 60m and a
-# p90 under 250m, so the enrichment is spent almost entirely where conversion is
-# actually possible. Past about 1km the rate is indistinguishable from P_FLOOR,
-# which is deliberate, that far out nothing converts and the 1/p weight carries
-# the population back anyway.
+# p90 under 250m, so the enrichment is spent almost entirely where conversion
+# is actually possible. Past about 1km the rate is indistinguishable from
+# P_FLOOR, which is deliberate, that far out nothing converts and the 1/p
+# weight carries the population back anyway. Not exposed on the CLI, unlike
+# TAU_M: it is a floor against zero probability, not a modeling choice worth
+# sweeping per dataset.
 TAU_M = 200.0
 P_FLOOR = 0.01
 
 # The two levers are separate on purpose. Duplicating rows relaxes
 # min_data_in_leaf, which counts rows and ignores weights, so trees can split
 # more finely around converters. The weight is what actually moves the loss,
-# since LightGBM accumulates weighted gradients and hessians: it takes effective
-# positive prevalence from 0.28% natural to about 2.7%.
+# since LightGBM accumulates weighted gradients and hessians: at the defaults
+# below it takes effective positive prevalence from 0.28% natural to about
+# 2.7%.
 POS_ROW_DUP = 2
 POS_WEIGHT_MULT = 10.0
 
@@ -96,17 +111,44 @@ M2_PER_ACRE = 4046.8564224
 PIXEL_ACRES = 30 * 30 / M2_PER_ACRE
 
 
+def dataset_dir(dataset_name: str) -> str:
+    return os.path.join(DATASETS_DIR, dataset_name)
+
+
+def config_path(dataset_name: str) -> str:
+    return os.path.join(dataset_dir(dataset_name), "config.json")
+
+
+def load_config(dataset_name: str) -> dict:
+    path = config_path(dataset_name)
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(dataset_name: str, updates: dict) -> None:
+    """Merges updates into the dataset's config.json rather than overwriting
+    it, since folds and pool each contribute their own half of the picture
+    and both need to survive in the same file."""
+    cfg = load_config(dataset_name)
+    cfg.update(updates)
+    os.makedirs(dataset_dir(dataset_name), exist_ok=True)
+    with open(config_path(dataset_name), "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+
+
 def connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.execute(f"CREATE OR REPLACE VIEW samples AS SELECT * FROM read_parquet('{JOINED_GLOB}')")
     return con
 
 
-def attach_folds(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Register block_folds.parquet and expose the samples_fold view."""
-    if not os.path.exists(BLOCK_FOLDS_PATH):
-        raise SystemExit(f"{BLOCK_FOLDS_PATH} not found, run `build_train_pool.py folds` first")
-    folds = pd.read_parquet(BLOCK_FOLDS_PATH)
+def attach_folds(con: duckdb.DuckDBPyConnection, block_folds_path: str) -> pd.DataFrame:
+    """Register a dataset's block_folds.parquet and expose the samples_fold view."""
+    if not os.path.exists(block_folds_path):
+        raise SystemExit(f"{block_folds_path} not found, run `build_train_pool.py folds` for this dataset first")
+    folds = pd.read_parquet(block_folds_path)
     con.register("block_fold", folds[["block_id", "fold"]])
     con.execute("""
         CREATE OR REPLACE VIEW samples_fold AS
@@ -206,8 +248,10 @@ def fold_summary(stats: pd.DataFrame) -> pd.DataFrame:
 
 
 def cmd_folds(args):
-    if os.path.exists(BLOCK_FOLDS_PATH) and not args.force:
-        print(f"{BLOCK_FOLDS_PATH} exists, use --force to rebuild")
+    ddir = dataset_dir(args.dataset_name)
+    block_folds_path = os.path.join(ddir, "block_folds.parquet")
+    if os.path.exists(block_folds_path) and not args.force:
+        print(f"{block_folds_path} exists, use --force to rebuild")
         return
 
     con = connect()
@@ -216,7 +260,7 @@ def cmd_folds(args):
     print(f"  {len(stats)} blocks, {stats['n'].sum():,} rows, "
           f"{stats['n1'].sum():,} label=1, {stats['n2'].sum():,} label=2")
 
-    stats = assign_folds(stats)
+    stats = assign_folds(stats, k=args.k_folds, seed=args.seed)
     summary = fold_summary(stats)
     print(summary.to_string(index=False, float_format=lambda v: f"{v:+.3f}"))
 
@@ -225,13 +269,20 @@ def cmd_folds(args):
         assert worst < 1.0, f"{col} is {worst:.2f}% off target, expected under 1%"
     assert stats["block_id"].is_unique, "a block landed in more than one fold"
 
-    os.makedirs(os.path.dirname(BLOCK_FOLDS_PATH), exist_ok=True)
-    stats.sort_values("block_id").to_parquet(BLOCK_FOLDS_PATH, index=False)
-    print(f"wrote {BLOCK_FOLDS_PATH}")
+    os.makedirs(ddir, exist_ok=True)
+    stats.sort_values("block_id").to_parquet(block_folds_path, index=False)
+    print(f"wrote {block_folds_path}")
+
+    save_config(args.dataset_name, {
+        "dataset_name": args.dataset_name,
+        "k_folds": args.k_folds,
+        "seed": args.seed,
+    })
 
 
-def fold_calibration(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """Solve the per fold decay constant A_k so every fold contributes ROWS_PER_FOLD.
+def fold_calibration(con: duckdb.DuckDBPyConnection, tau_m: float, p_floor: float,
+                     pos_row_dup: int, rows_per_fold: int) -> pd.DataFrame:
+    """Solve the per fold decay constant A_k so every fold contributes rows_per_fold.
 
     Closed form because p never gets near 1 on this data (it tops out around
     0.17 at the 30m minimum distance), so the LEAST(1.0, ...) clamp in the draw
@@ -244,49 +295,66 @@ def fold_calibration(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                SUM(CASE WHEN label = 1 THEN 1 ELSE 0 END) AS n1,
                SUM(CASE WHEN label = 2 THEN 1 ELSE 0 END) AS n2,
                SUM(CASE WHEN label = 0 THEN 1 ELSE 0 END) AS n0,
-               AVG(CASE WHEN label = 0 THEN EXP(-{DIST_COL} / {TAU_M}) END) AS mean_decay
+               AVG(CASE WHEN label = 0 THEN EXP(-{DIST_COL} / {tau_m}) END) AS mean_decay
         FROM samples_fold
         GROUP BY fold
         ORDER BY fold
     """).df()
 
-    agg["budget0"] = ROWS_PER_FOLD - POS_ROW_DUP * agg["n1"] - agg["n2"]
-    agg["A"] = (agg["budget0"] / agg["n0"] - P_FLOOR) / agg["mean_decay"]
+    agg["budget0"] = rows_per_fold - pos_row_dup * agg["n1"] - agg["n2"]
+    agg["A"] = (agg["budget0"] / agg["n0"] - p_floor) / agg["mean_decay"]
 
     assert (agg["budget0"] > 0).all(), "rare classes alone overflow the per fold budget"
     assert (agg["A"] > 0).all(), "P_FLOOR alone already overshoots the budget, lower it"
-    p_max = P_FLOOR + agg["A"] * np.exp(-30.0 / TAU_M)
+    p_max = p_floor + agg["A"] * np.exp(-30.0 / tau_m)
     assert (p_max < 1.0).all(), f"keep rate saturates (max {p_max.max():.3f}), closed form is invalid"
     return agg
 
 
 def cmd_pool(args):
-    if os.path.exists(TRAIN_POOL_PATH) and not args.force:
-        print(f"{TRAIN_POOL_PATH} exists, use --force to rebuild")
+    ddir = dataset_dir(args.dataset_name)
+    block_folds_path = os.path.join(ddir, "block_folds.parquet")
+    train_pool_path = os.path.join(ddir, "gb_train_pool.parquet")
+
+    if os.path.exists(train_pool_path) and not args.force:
+        print(f"{train_pool_path} exists, use --force to rebuild")
         return
 
-    con = connect()
-    attach_folds(con)
+    cfg = load_config(args.dataset_name)
+    if "k_folds" not in cfg:
+        raise SystemExit(f"no fold assignment for dataset '{args.dataset_name}', "
+                         f"run `folds --dataset-name {args.dataset_name}` first")
+    k_folds = cfg["k_folds"]
+    rows_per_fold = args.rows_per_training_set // (k_folds - 1)
 
-    calib = fold_calibration(con)
+    con = connect()
+    attach_folds(con, block_folds_path)
+
+    calib = fold_calibration(con, args.tau_m, P_FLOOR, args.pos_row_dup, rows_per_fold)
     print(calib.to_string(index=False, float_format=lambda v: f"{v:,.5f}"))
     con.register("fold_calib", calib[["fold", "A"]])
 
-    pos_weight = POS_WEIGHT_MULT / POS_ROW_DUP
+    pos_weight = args.pos_weight_mult / args.pos_row_dup
     bands = ", ".join(BAND_COLS)
     carried = f'"row", "col", block_id, fold, x, y, {DIST_COL}, label, label_bin, p_include, sample_weight'
 
     # random() is not reproducible across thread counts, so the draw hangs off a
     # hash of the pixel key instead. (row, col) is unique statewide.
-    os.makedirs(os.path.dirname(TRAIN_POOL_PATH), exist_ok=True)
+    dup_selects = "\n            UNION ALL\n            ".join(
+        f"SELECT {carried}, TRUE AS is_dup, {bands} FROM drawn WHERE label = 1"
+        for _ in range(args.pos_row_dup - 1)
+    )
+    extra_union = f"\n            UNION ALL\n            {dup_selects}" if dup_selects else ""
+
+    os.makedirs(ddir, exist_ok=True)
     con.execute(f"""
         COPY (
             WITH scored AS (
                 SELECT s.*,
                        CASE WHEN s.label IN (1, 2) THEN 1.0
-                            ELSE LEAST(1.0, {P_FLOOR} + c.A * EXP(-s.{DIST_COL} / {TAU_M}))
+                            ELSE LEAST(1.0, {P_FLOOR} + c.A * EXP(-s.{DIST_COL} / {args.tau_m}))
                        END AS p_include,
-                       (hash(s."row", s."col", {DRAW_SEED}) % 1073741824) / 1073741824.0 AS u
+                       (hash(s."row", s."col", {args.draw_seed}) % 1073741824) / 1073741824.0 AS u
                 FROM samples_fold s
                 JOIN fold_calib c USING (fold)
             ),
@@ -297,10 +365,8 @@ def cmd_pool(args):
                 FROM scored
                 WHERE u < p_include
             )
-            SELECT {carried}, FALSE AS is_dup, {bands} FROM drawn
-            UNION ALL
-            SELECT {carried}, TRUE AS is_dup, {bands} FROM drawn WHERE label = 1
-        ) TO '{TRAIN_POOL_PATH}' (FORMAT PARQUET)
+            SELECT {carried}, FALSE AS is_dup, {bands} FROM drawn{extra_union}
+        ) TO '{train_pool_path}' (FORMAT PARQUET)
     """)
 
     counts = con.execute(f"""
@@ -309,11 +375,22 @@ def cmd_pool(args):
                SUM(CASE WHEN label = 2 THEN 1 ELSE 0 END) AS n2,
                SUM(CASE WHEN label = 0 THEN 1 ELSE 0 END) AS n0,
                SUM(sample_weight) AS sum_w
-        FROM read_parquet('{TRAIN_POOL_PATH}')
+        FROM read_parquet('{train_pool_path}')
         GROUP BY fold ORDER BY fold
     """).df()
     print(counts.to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
-    print(f"wrote {TRAIN_POOL_PATH} ({counts['pool_rows'].sum():,} rows)")
+    print(f"wrote {train_pool_path} ({counts['pool_rows'].sum():,} rows)")
+
+    save_config(args.dataset_name, {
+        "dataset_name": args.dataset_name,
+        "tau_m": args.tau_m,
+        "p_floor": P_FLOOR,
+        "pos_row_dup": args.pos_row_dup,
+        "pos_weight_mult": args.pos_weight_mult,
+        "rows_per_training_set": args.rows_per_training_set,
+        "rows_per_fold": rows_per_fold,
+        "draw_seed": args.draw_seed,
+    })
 
 
 def _quantiles(con, table: str, where: str, tag: str) -> pd.DataFrame:
@@ -328,9 +405,17 @@ def _quantiles(con, table: str, where: str, tag: str) -> pd.DataFrame:
 
 
 def cmd_report(args):
+    ddir = dataset_dir(args.dataset_name)
+    block_folds_path = os.path.join(ddir, "block_folds.parquet")
+    train_pool_path = os.path.join(ddir, "gb_train_pool.parquet")
+
+    cfg = load_config(args.dataset_name)
+    print(f"== dataset '{args.dataset_name}'")
+    print(json.dumps(cfg, indent=2, sort_keys=True))
+
     con = connect()
-    folds = attach_folds(con)
-    con.execute(f"CREATE OR REPLACE VIEW pool AS SELECT * FROM read_parquet('{TRAIN_POOL_PATH}')")
+    folds = attach_folds(con, block_folds_path)
+    con.execute(f"CREATE OR REPLACE VIEW pool AS SELECT * FROM read_parquet('{train_pool_path}')")
 
     natural = con.execute("""
         SELECT fold, COUNT(*) AS nat_rows,
@@ -378,25 +463,30 @@ def cmd_report(args):
     print(f"\n== {DIST_COL} (metres)")
     print(dist.to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
 
-    os.makedirs(FOLD_REPORT_DIR, exist_ok=True)
-    rep[cols].to_csv(os.path.join(FOLD_REPORT_DIR, "fold_report.csv"), index=False)
-    dist.to_csv(os.path.join(FOLD_REPORT_DIR, "fold_distance_quantiles.csv"), index=False)
-    print(f"\nwrote {FOLD_REPORT_DIR}/fold_report.csv and fold_distance_quantiles.csv")
-
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_f = sub.add_parser("folds")
+    p_f.add_argument("--dataset-name", required=True)
     p_f.add_argument("--force", action="store_true")
+    p_f.add_argument("--k-folds", type=int, default=K_FOLDS)
+    p_f.add_argument("--seed", type=int, default=SEED)
     p_f.set_defaults(func=cmd_folds)
 
     p_p = sub.add_parser("pool")
+    p_p.add_argument("--dataset-name", required=True)
     p_p.add_argument("--force", action="store_true")
+    p_p.add_argument("--tau-m", type=float, default=TAU_M)
+    p_p.add_argument("--pos-row-dup", type=int, default=POS_ROW_DUP)
+    p_p.add_argument("--pos-weight-mult", type=float, default=POS_WEIGHT_MULT)
+    p_p.add_argument("--rows-per-training-set", type=int, default=ROWS_PER_TRAINING_SET)
+    p_p.add_argument("--draw-seed", type=int, default=DRAW_SEED)
     p_p.set_defaults(func=cmd_pool)
 
     p_r = sub.add_parser("report")
+    p_r.add_argument("--dataset-name", required=True)
     p_r.set_defaults(func=cmd_report)
 
     args = p.parse_args()
