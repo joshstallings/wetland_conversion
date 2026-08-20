@@ -22,6 +22,33 @@ _STANDARD_GRID = {
     "early_stopping_rounds": [10, 30],
 }
 
+# Aimed at the imbalance itself rather than general capacity. scale_pos_weight
+# and is_unbalance are deliberately left out: sample_weight already encodes
+# the class balance the pool was built with, and stacking LightGBM's own
+# rebalancing on top of that would just double count it.
+#   - min_child_samples: LightGBM's leaf size floor counts raw rows, not
+#     weighted mass, so it's what actually limits how finely a tree can
+#     isolate a small cluster of converters, independent of how much weight
+#     they carry. 20 is the library default; 5 tests relaxing it.
+#   - boosting_type "goss": keeps the rows with the largest gradients (the
+#     ones the model is currently getting wrong) and subsamples the rest,
+#     which for a rare positive class means it's the hard, informative rows
+#     that stick around, not a random slice of easy ones.
+#   - reg_lambda: leaf value L2 penalty, checked against the smaller
+#     min_child_samples in case relaxing the leaf floor just trades cleaner
+#     recall for overfit noise in tiny leaves.
+# n_estimators is fixed high with early stopping doing the real search, so
+# the grid's combinations go toward the imbalance-relevant knobs instead.
+_IMBALANCE_GRID = {
+    "n_estimators": [500],
+    "learning_rate": [0.05, 0.1],
+    "num_leaves": [31, 63],
+    "min_child_samples": [5, 20],
+    "boosting_type": ["gbdt", "goss"],
+    "reg_lambda": [0.0, 1.0],
+    "early_stopping_rounds": [30],
+}
+
 
 @dataclass
 class ExperimentConfig:
@@ -78,6 +105,36 @@ EXPERIMENTS = {
         dataset_name="neighborhood-v1",
         feature_cols=DIST_PLUS_NEIGHBORHOOD_FEATURE_COLS,
         # baseline only, no grid configured
+    ),
+    "Experiment4-BaselineV2": ExperimentConfig(
+        # same feature set as full-features, but against baseline-v2, which
+        # drops the hand picked pos_weight_mult=10 for one derived from the
+        # natural class balance (n_neg_natural / n_pos_natural, ~356 here),
+        # so label=1 and label!=1 carry equal total weight in the loss
+        experiment_name="Experiment4-BaselineV2",
+        dataset_name="baseline-v2",
+        feature_cols=FEATURE_COLS,
+        # baseline only, no grid configured
+    ),
+    "Experiment5-BaselineV2-Neighborhood": ExperimentConfig(
+        # Experiment4-BaselineV2 plus the six neighborhood columns, against
+        # neighborhood-v2: same derived pos_weight_mult (~356) as baseline-v2,
+        # built with --with-neighborhood-features instead
+        experiment_name="Experiment5-BaselineV2-Neighborhood",
+        dataset_name="neighborhood-v2",
+        feature_cols=EXTENDED_FEATURE_COLS,
+        grid=_IMBALANCE_GRID,
+    ),
+    "Experiment5b-BaselineV2-NoNeighborhood": ExperimentConfig(
+        # the Experiment5 counterpart without the six neighborhood columns,
+        # same relationship 3b has to 3: same dataset (baseline-v2, so same
+        # derived pos_weight_mult) and feature set as Experiment4-BaselineV2,
+        # but screened against _IMBALANCE_GRID instead of left at defaults,
+        # so it's a fair grid-search comparison against Experiment5
+        experiment_name="Experiment5b-BaselineV2-NoNeighborhood",
+        dataset_name="baseline-v2",
+        feature_cols=FEATURE_COLS,
+        grid=_IMBALANCE_GRID,
     ),
 }
 

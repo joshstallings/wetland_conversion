@@ -29,6 +29,19 @@ model_analysis.ipynb only ever loads from disk.
       restarted after an interruption without redoing finished work. Pass
       --force to redo every run anyway.
 
+  grid-finalize
+      Refits one grid-search run's winning combination (params.txt in its
+      run_NNN directory) on the exact same fit frame it was screened on,
+      writes model.joblib into that run directory (skipped if one is already
+      there, pass --force to redo), then writes run_NNN/model_analysis/:
+      precision/recall/accuracy and a PR curve against its own training
+      data, plus the same three metrics streamed against every fold's
+      natural population. Folds 2/3/4 fed the fit (through a subsampled,
+      weighted slice, not this full natural population) and fold 1 set
+      early stopping, so only fold 0 is a genuine generalization check;
+      still worth running `baseline` on the winning combo for a real CV
+      estimate.
+
   status
       Prints what is already on disk for an experiment: whether baseline has
       run and how many fold models it left behind, and how many grid runs
@@ -37,6 +50,7 @@ model_analysis.ipynb only ever loads from disk.
 Usage:
     python scripts/gb_train.py baseline --experiment NAME [--force]
     python scripts/gb_train.py grid-search --experiment NAME [--force]
+    python scripts/gb_train.py grid-finalize --experiment NAME [--run run_NNN]
     python scripts/gb_train.py status --experiment NAME
 """
 
@@ -56,6 +70,8 @@ from sklearn.metrics import (
     auc,
     average_precision_score,
     precision_recall_curve,
+    precision_score,
+    recall_score,
     roc_auc_score,
     roc_curve,
 )
@@ -225,6 +241,35 @@ def _read_best_iteration(run_dir: str) -> int | None:
     return None
 
 
+def grid_split(cfg: experiments.ExperimentConfig, con, train_pool: pd.DataFrame, k_folds: int):
+    """The fold split grid-search screens against: fold 0 held out as the
+    screening test, fold 1 as an early stopping validation set pulled from
+    the natural distribution, the rest as training data. Factored out of
+    cmd_grid_search so grid-finalize can rebuild the exact same training
+    frame a winning run was fit on, rather than a fresh, differently shuffled
+    one.
+
+    Returns (X_fit, y_fit, w_fit, X_val, y_val, screen_fold, val_fold,
+    train_folds, log_mean, log_std).
+    """
+    screen_fold = 0
+    val_fold = (screen_fold + 1) % k_folds
+    train_folds = [f for f in range(k_folds) if f not in (screen_fold, val_fold)]
+    val_rows = 1_000_000
+
+    log_mean, log_std = gb_common.fit_dist_normalizer_excluding(con, [screen_fold, val_fold])
+    fit_frame = train_pool[train_pool["fold"].isin(train_folds)].pipe(gb_common.add_normalized_dist, log_mean, log_std)
+    X_fit = fit_frame[cfg.feature_cols]
+    y_fit = fit_frame[gb_common.TARGET_COL]
+    w_fit = fit_frame["sample_weight"] / fit_frame["sample_weight"].mean()
+
+    val_frame = gb_common.natural_fold_sample(con, val_fold, val_rows, log_mean, log_std)
+    X_val = val_frame[cfg.feature_cols]
+    y_val = val_frame[gb_common.TARGET_COL]
+
+    return X_fit, y_fit, w_fit, X_val, y_val, screen_fold, val_fold, train_folds, log_mean, log_std
+
+
 def cmd_grid_search(args):
     cfg = experiments.get(args.experiment)
     if cfg.grid is None:
@@ -240,22 +285,8 @@ def cmd_grid_search(args):
     con, _ = gb_common.connect_samples(cfg.dataset_name)
     train_pool = gb_common.load_train_pool(cfg.dataset_name)
 
-    # fold 0 held out as the screening test, fold 1 as an early stopping
-    # validation set, the rest as training data
-    screen_fold = 0
-    val_fold = (screen_fold + 1) % k_folds
-    train_folds = [f for f in range(k_folds) if f not in (screen_fold, val_fold)]
-    val_rows = 1_000_000
-
-    log_mean, log_std = gb_common.fit_dist_normalizer_excluding(con, [screen_fold, val_fold])
-    fit_frame = train_pool[train_pool["fold"].isin(train_folds)].pipe(gb_common.add_normalized_dist, log_mean, log_std)
-    X_fit = fit_frame[cfg.feature_cols]
-    y_fit = fit_frame[gb_common.TARGET_COL]
-    w_fit = fit_frame["sample_weight"] / fit_frame["sample_weight"].mean()
-
-    val_frame = gb_common.natural_fold_sample(con, val_fold, val_rows, log_mean, log_std)
-    X_val = val_frame[cfg.feature_cols]
-    y_val = val_frame[gb_common.TARGET_COL]
+    X_fit, y_fit, w_fit, X_val, y_val, screen_fold, val_fold, train_folds, log_mean, log_std = grid_split(
+        cfg, con, train_pool, k_folds)
 
     grid_keys = list(cfg.grid.keys())
     grid_combos = list(itertools.product(*cfg.grid.values()))
@@ -278,11 +309,13 @@ def cmd_grid_search(args):
             continue
 
         try:
-            model = lgb.LGBMClassifier(
-                random_state=random_state, verbosity=-1,
-                n_estimators=params["n_estimators"], learning_rate=params["learning_rate"],
-                num_leaves=params["num_leaves"], feature_fraction=params["feature_fraction"],
-            )
+            # early_stopping_rounds drives the callback below, not a
+            # LGBMClassifier constructor arg, so it's the one grid key held
+            # back; everything else in the combo is passed straight through,
+            # which is what lets the grid sweep params like min_child_samples
+            # or boosting_type without a new hardcoded line here each time
+            model_kwargs = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
+            model = lgb.LGBMClassifier(random_state=random_state, verbosity=-1, **model_kwargs)
             model.fit(
                 X_fit, y_fit, sample_weight=w_fit,
                 eval_X=X_val, eval_y=y_val,
@@ -322,6 +355,165 @@ def cmd_grid_search(args):
     if "avg_precision" in summary.columns:
         summary = summary.sort_values("avg_precision", ascending=False)
     print(summary.head(10).to_string(index=False))
+
+
+def _read_params_txt(run_dir: str) -> dict:
+    """params.txt as cmd_grid_search writes it: every grid key plus a
+    handful of run metadata (random_state, screen_fold, val_fold,
+    train_folds, best_iteration), one `key=value` per line, values still
+    strings. grid-finalize sorts those back into fit kwargs vs metadata."""
+    params = {}
+    for line in open(os.path.join(run_dir, "params.txt")):
+        k, v = line.strip().split("=", 1)
+        params[k] = v
+    return params
+
+
+def _coerce_grid_value(v: str):
+    """params.txt only ever holds what an experiment's grid dict can hold:
+    ints, floats, or plain strings like boosting_type's 'gbdt'/'goss'. A
+    float parse that comes out integral and had no decimal point in the
+    original text round trips ints; anything else that fails to parse is a
+    string param, passed through as-is."""
+    try:
+        f = float(v)
+        return int(f) if f.is_integer() and "." not in v else f
+    except ValueError:
+        return v
+
+
+def cmd_grid_finalize(args):
+    cfg = experiments.get(args.experiment)
+    grid_dir = os.path.join(cfg.results_dir, "grid_search")
+
+    run_id = args.run
+    if run_id is None:
+        summary = pd.read_csv(os.path.join(grid_dir, "grid_search_summary.csv"))
+        run_id = f"run_{int(summary.sort_values('avg_precision', ascending=False).iloc[0]['run_id']):03d}"
+    run_dir = os.path.join(grid_dir, run_id)
+    if not os.path.exists(run_dir):
+        raise SystemExit(f"{run_dir} not found")
+
+    dcfg = gb_common.load_dataset_config(cfg.dataset_name)
+    k_folds = dcfg.get("k_folds", gb_common.K_FOLDS)
+    con, _ = gb_common.connect_samples(cfg.dataset_name)
+    train_pool = gb_common.load_train_pool(cfg.dataset_name)
+
+    # rebuild the exact frame this run was screened on, so a refit (if one
+    # is needed below) reproduces it, and so the natural fold scoring further
+    # down normalizes distance the same way training did
+    X_fit, y_fit, w_fit, X_val, y_val, screen_fold, val_fold, train_folds, log_mean, log_std = grid_split(
+        cfg, con, train_pool, k_folds)
+
+    model_path = os.path.join(run_dir, "model.joblib")
+    if os.path.exists(model_path) and not args.force:
+        model = joblib.load(model_path)
+        print(f"{model_path} already on disk, loading rather than refitting (--force to redo)")
+    else:
+        raw = _read_params_txt(run_dir)
+        meta_keys = {"random_state", "screen_fold", "val_fold", "train_folds", "best_iteration"}
+        params = {k: _coerce_grid_value(v) for k, v in raw.items() if k not in meta_keys}
+        random_state = int(raw["random_state"])
+
+        model_kwargs = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
+        model = lgb.LGBMClassifier(random_state=random_state, verbosity=-1, **model_kwargs)
+        model.fit(
+            X_fit, y_fit, sample_weight=w_fit,
+            eval_X=X_val, eval_y=y_val,
+            eval_metric="average_precision",
+            callbacks=[lgb.early_stopping(
+                stopping_rounds=params["early_stopping_rounds"], first_metric_only=True, verbose=False)],
+        )
+        recorded_best_iter = int(raw["best_iteration"])
+        if model.best_iteration_ != recorded_best_iter:
+            print(f"warning: refit best_iteration {model.best_iteration_} != recorded {recorded_best_iter}, "
+                  f"the grid search screen wasn't exactly reproducible on this refit")
+        joblib.dump(model, model_path)
+        print(f"wrote {model_path}")
+
+    analysis_dir = os.path.join(run_dir, "model_analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+
+    # own training data, i.e. the weighted, duplicated fit frame itself, not
+    # a held out fold - this is a memorization check, not a generalization
+    # one, and the model's implicit 0.5 decision boundary is on that same
+    # heavily upweighted/duplicated pool, not the natural class balance
+    proba_fit = model.predict_proba(X_fit)[:, 1]
+    pred_fit = (proba_fit >= 0.5).astype(int)
+    train_metrics = pd.DataFrame([{
+        "n_rows": len(y_fit),
+        "n_positive": int(y_fit.sum()),
+        "precision": precision_score(y_fit, pred_fit),
+        "recall": recall_score(y_fit, pred_fit),
+        "accuracy": accuracy_score(y_fit, pred_fit),
+    }])
+    metrics_path = os.path.join(analysis_dir, "train_metrics.csv")
+    train_metrics.to_csv(metrics_path, index=False)
+    print(train_metrics.to_string(index=False, float_format=lambda v: f"{v:,.4f}"))
+    print(f"wrote {metrics_path}")
+
+    precision_curve, recall_curve, _ = precision_recall_curve(y_fit, proba_fit)
+    pr_auc = auc(recall_curve, precision_curve)
+    avg_prec = average_precision_score(y_fit, proba_fit)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot(recall_curve, precision_curve, color="#0072B2", label=f"AP {avg_prec:.3f}, PR-AUC {pr_auc:.3f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(f"Precision and recall on training data: {args.experiment} {run_id}")
+    ax.legend(loc="upper right")
+    pr_plot_path = os.path.join(analysis_dir, "train_pr_curve.png")
+    fig.savefig(pr_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {pr_plot_path}")
+
+    # every fold's natural, unweighted population, same rows baseline scores
+    # against. Folds 2/3/4 fed the fit (through a subsampled, weighted slice,
+    # not this full natural population) and fold 1 set early stopping, so
+    # only fold 0 is genuinely held out; the rest are a fit check on data
+    # partly or fully seen, not a fair read on generalization
+    role_by_fold = {screen_fold: "test (held out)", val_fold: "val (early stopping)"}
+    role_by_fold.update({f: "train" for f in train_folds})
+    fold_rows = []
+    fold_pr_curves = {}
+    for fold_id in range(k_folds):
+        y_true, y_score = gb_common.predict_fold(con, model, fold_id, log_mean, log_std, cfg.feature_cols)
+        pred = (y_score >= 0.5).astype(int)
+        row = {
+            "fold": fold_id,
+            "role": role_by_fold[fold_id],
+            "n_rows": len(y_true),
+            "n_positive": int(y_true.sum()),
+            "precision": precision_score(y_true, pred, zero_division=0),
+            "recall": recall_score(y_true, pred, zero_division=0),
+            "accuracy": accuracy_score(y_true, pred),
+        }
+        fold_rows.append(row)
+        print(f"fold {fold_id} ({row['role']}): precision={row['precision']:.4f}  "
+              f"recall={row['recall']:.4f}  accuracy={row['accuracy']:.4f}")
+
+        # curve needs the full score, not the 0.5 cutoff above, so it's
+        # built off the same y_true/y_score rather than the row's hard preds
+        p_curve, r_curve, _ = precision_recall_curve(y_true, y_score)
+        fold_pr_curves[fold_id] = (r_curve, p_curve, average_precision_score(y_true, y_score))
+        del y_true, y_score, pred
+
+    fold_metrics = pd.DataFrame(fold_rows)
+    fold_metrics_path = os.path.join(analysis_dir, "fold_metrics.csv")
+    fold_metrics.to_csv(fold_metrics_path, index=False)
+    print(f"wrote {fold_metrics_path}")
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for fold_id, (r_curve, p_curve, avg_prec_fold) in fold_pr_curves.items():
+        ax.plot(r_curve, p_curve, color=gb_common.FOLD_COLORS[fold_id],
+                label=f"fold {fold_id} ({role_by_fold[fold_id]}, AP {avg_prec_fold:.3f})")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(f"Precision and recall by fold, natural data: {args.experiment} {run_id}")
+    ax.legend(loc="upper right", fontsize="small")
+    fold_pr_path = os.path.join(analysis_dir, "fold_pr_curve.png")
+    fig.savefig(fold_pr_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {fold_pr_path}")
 
 
 def cmd_status(args):
@@ -368,6 +560,14 @@ def main():
     p_g.add_argument("--experiment", required=True)
     p_g.add_argument("--force", action="store_true")
     p_g.set_defaults(func=cmd_grid_search)
+
+    p_gf = sub.add_parser("grid-finalize")
+    p_gf.add_argument("--experiment", required=True)
+    p_gf.add_argument("--run", default=None,
+                      help="run_NNN under that experiment's grid_search/; default is whichever run "
+                           "has the highest avg_precision in grid_search_summary.csv")
+    p_gf.add_argument("--force", action="store_true", help="refit even if model.joblib is already on disk")
+    p_gf.set_defaults(func=cmd_grid_finalize)
 
     p_s = sub.add_parser("status")
     p_s.add_argument("--experiment", required=True)

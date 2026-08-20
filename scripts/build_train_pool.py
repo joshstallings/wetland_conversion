@@ -48,19 +48,22 @@ shell history to know what produced it.
 
 On weighting: label=0 rows carry 1/p, so in expectation they reconstruct the
 true label=0 population, and label=2 sits at p=1 and weight 1, so it
-represents exactly itself. That leaves the deliberate pos-weight-mult boost
-on label=1 as the only place the pool departs from reality, which is what
-makes the model's scores recoverable back to real conversion probabilities
-with p_true = p / (p + pos_weight_mult * (1 - p)). scripts/gb_common.py's
+represents exactly itself. That leaves the pos-weight-mult boost on label=1
+as the only place the pool departs from reality, which is what makes the
+model's scores recoverable back to real conversion probabilities with
+p_true = p / (p + pos_weight_mult * (1 - p)). scripts/gb_common.py's
 calibrate() applies that correction before anything gets reported in
-probability units.
+probability units. Left unset, pos-weight-mult is derived rather than hand
+picked: n_neg_natural / n_pos_natural, the ratio that gives label=1 and
+label!=1 equal total weight in the loss (natural_pos_weight_mult). Pass
+--pos-weight-mult to pin a specific value instead.
 
 Usage:
     python scripts/build_train_pool.py features [--force]
     python scripts/build_train_pool.py folds --dataset-name NAME [--force]
         [--k-folds 5] [--seed 0]
     python scripts/build_train_pool.py pool --dataset-name NAME [--force]
-        [--tau-m 200.0] [--pos-row-dup 2] [--pos-weight-mult 10.0]
+        [--tau-m 200.0] [--pos-row-dup 2] [--pos-weight-mult VALUE]
         [--rows-per-training-set 2500000] [--draw-seed 42]
         [--with-neighborhood-features]
     python scripts/build_train_pool.py report --dataset-name NAME
@@ -121,11 +124,18 @@ P_FLOOR = 0.01
 # The two levers are separate on purpose. Duplicating rows relaxes
 # min_data_in_leaf, which counts rows and ignores weights, so trees can split
 # more finely around converters. The weight is what actually moves the loss,
-# since LightGBM accumulates weighted gradients and hessians: at the defaults
-# below it takes effective positive prevalence from 0.28% natural to about
-# 2.7%.
+# since LightGBM accumulates weighted gradients and hessians.
 POS_ROW_DUP = 2
-POS_WEIGHT_MULT = 10.0
+
+# None means derive it from the data: n_neg_natural / n_pos_natural, the
+# scale_pos_weight ratio that makes label=1 and label!=1 carry equal total
+# weight in the loss (see natural_pos_weight_mult). That ratio comes out
+# around 355 on this data, since conversions are under 0.3% of samples, so
+# it pulls the model much harder toward the positive class than a hand
+# picked constant like the old default of 10.0 did. Pass --pos-weight-mult
+# explicitly to pin a specific value instead, e.g. to reproduce a dataset
+# built before this was auto derived.
+POS_WEIGHT_MULT = None
 
 SEED = 0
 DRAW_SEED = 42
@@ -361,6 +371,22 @@ def fold_calibration(con: duckdb.DuckDBPyConnection, tau_m: float, p_floor: floa
     return agg
 
 
+def natural_pos_weight_mult(fold_calib: pd.DataFrame) -> float:
+    """n_neg_natural / n_pos_natural before any subsampling, i.e. the classic
+    scale_pos_weight ratio: weighting each label=1 row by this much makes the
+    positive and negative classes carry equal total weight in the loss, so
+    the model trains as if conversions were as common as everything else.
+    label=2 (converted, but not to development) counts on the negative side
+    here, same as it does in label_bin.
+
+    Reuses fold_calibration's per fold n0/n1/n2 counts rather than a fresh
+    query, since cmd_pool already has them on hand.
+    """
+    n_pos = fold_calib["n1"].sum()
+    n_neg = fold_calib["n0"].sum() + fold_calib["n2"].sum()
+    return n_neg / n_pos
+
+
 def cmd_pool(args):
     ddir = dataset_dir(args.dataset_name)
     block_folds_path = os.path.join(ddir, "block_folds.parquet")
@@ -384,7 +410,12 @@ def cmd_pool(args):
     print(calib.to_string(index=False, float_format=lambda v: f"{v:,.5f}"))
     con.register("fold_calib", calib[["fold", "A"]])
 
-    pos_weight = args.pos_weight_mult / args.pos_row_dup
+    pos_weight_mult = args.pos_weight_mult
+    if pos_weight_mult is None:
+        pos_weight_mult = natural_pos_weight_mult(calib)
+        print(f"pos_weight_mult not given, derived {pos_weight_mult:,.2f} from natural class counts")
+
+    pos_weight = pos_weight_mult / args.pos_row_dup
     bands = ", ".join(BAND_COLS)
     carried = f'"row", "col", block_id, fold, x, y, {DIST_COL}, label, label_bin, p_include, sample_weight'
     if args.with_neighborhood_features:
@@ -438,7 +469,7 @@ def cmd_pool(args):
         "tau_m": args.tau_m,
         "p_floor": P_FLOOR,
         "pos_row_dup": args.pos_row_dup,
-        "pos_weight_mult": args.pos_weight_mult,
+        "pos_weight_mult": pos_weight_mult,
         "rows_per_training_set": args.rows_per_training_set,
         "rows_per_fold": rows_per_fold,
         "draw_seed": args.draw_seed,
@@ -648,7 +679,9 @@ def main():
     p_p.add_argument("--force", action="store_true")
     p_p.add_argument("--tau-m", type=float, default=TAU_M)
     p_p.add_argument("--pos-row-dup", type=int, default=POS_ROW_DUP)
-    p_p.add_argument("--pos-weight-mult", type=float, default=POS_WEIGHT_MULT)
+    p_p.add_argument("--pos-weight-mult", type=float, default=POS_WEIGHT_MULT,
+                     help="fixed multiplier for label=1 rows; omit to derive it from the "
+                          "natural class balance instead (see natural_pos_weight_mult)")
     p_p.add_argument("--rows-per-training-set", type=int, default=ROWS_PER_TRAINING_SET)
     p_p.add_argument("--draw-seed", type=int, default=DRAW_SEED)
     p_p.add_argument("--with-neighborhood-features", action="store_true")

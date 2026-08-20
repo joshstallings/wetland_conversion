@@ -62,10 +62,12 @@ per fold counts, weights and distance quantiles for a named dataset.
 
 The sampling constants worth rerunning for are exposed on the CLI:
 `--tau-m`, `--pos-row-dup`, `--pos-weight-mult`, `--rows-per-training-set` on
-`pool`, `--k-folds` and `--seed` on `folds`. Whatever a dataset was actually
-built with, defaulted or overridden, gets written to
-`data/processed/datasets/NAME/config.json`, so the directory is self
-documenting.
+`pool`, `--k-folds` and `--seed` on `folds`. Leave `--pos-weight-mult` unset
+and it's derived from the data instead of hand picked: n_neg_natural /
+n_pos_natural, so label=1 and label!=1 end up with equal total weight in the
+loss. Whatever a dataset was actually built with, defaulted or overridden,
+gets written to `data/processed/datasets/NAME/config.json`, so the directory
+is self documenting.
 
 Both stages are deterministic, so rebuilding the same name reproduces the
 same split and the same draw. That depends on two things worth not undoing:
