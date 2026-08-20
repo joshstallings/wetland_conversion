@@ -2,12 +2,14 @@
 
 import ee
 
+from scripts.data_constants import ALPHAEARTH_DATASET, NLCD_ORIGIN_X, NLCD_ORIGIN_Y, NLCD_PIXEL_M
+
 GEE_PROJECT = "wetlands-ml-405421"
 
 # AlphaEarth Foundations annual embedding, 64 bands (A00-A63), native 10m pixels.
 # The collection is already tiled by UTM zone at the source, so a region that
 # straddles a UTM boundary needs a mosaic() of multiple granules - handled below.
-DATASET = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+DATASET = ALPHAEARTH_DATASET
 N_BANDS = 64
 
 # Same non-standard MRLC "AEA WGS84" Albers definition as the NLCD GeoTIFFs and
@@ -25,10 +27,9 @@ NLCD_CRS_WKT = (
     'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
 )
 
-# Also from that .tif header (rasterio's src.transform) - the exact 30m pixel
-# lattice NLCD sits on. Anything meant to stack with NLCD pixel-for-pixel
-# needs to snap to this, not just share NLCD_CRS_WKT.
-NLCD_ORIGIN_X, NLCD_ORIGIN_Y, NLCD_PIXEL_M = -2415585, 3314805, 30
+# NLCD_ORIGIN_X/Y/PIXEL_M (also from that .tif header) live in data_constants.py
+# now, shared with block_distance_profiles.py. Anything meant to stack with
+# NLCD pixel-for-pixel needs to snap to this grid, not just share NLCD_CRS_WKT.
 NLCD_TRANSFORM = [NLCD_PIXEL_M, 0, NLCD_ORIGIN_X, 0, -NLCD_PIXEL_M, NLCD_ORIGIN_Y]
 
 # 60km tiles for the 30m/uint8 export pipeline (export_alphaearth_30m.py) -

@@ -41,10 +41,10 @@ shape, reports the share of variance level alone accounts for, and offers
 --shape-only as the run that isolates whatever is left.
 
 Usage:
-    python scripts/block_distance_profiles.py profiles [--force]
-    python scripts/block_distance_profiles.py cluster [--k 6] [--force]
+    python -m scripts.dataset.block_distance_profiles profiles [--force]
+    python -m scripts.dataset.block_distance_profiles cluster [--k 6] [--force]
         [--shape-only] [--min-block-pixels 500] [--seed 0]
-    python scripts/block_distance_profiles.py report [--shape-only]
+    python -m scripts.dataset.block_distance_profiles report [--shape-only]
         [--dataset-name NAME]
 """
 
@@ -57,17 +57,18 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score, calinski_harabasz_score, silhouette_score
 
+from scripts.data_constants import NLCD_ORIGIN_X, NLCD_ORIGIN_Y
+
 JOINED_GLOB = "data/processed/alphaearth_wetland_joined/*.parquet"
 DATASETS_DIR = "data/processed/datasets"
 PROFILES_PATH = "data/processed/block_distance_profiles.parquet"
 
 DIST_COL = "dist_to_developed_2019_m"
 
-# Same 10km grid and absolute NLCD origin join_alphaearth_samples.py stamps
-# block_id with. Repeated rather than imported because that module pulls in
-# rasterio and the earth engine client just to be loaded.
+# Same 10km grid join_alphaearth_samples.py stamps block_id with.
+# NLCD_ORIGIN_X/Y come from data_constants.py rather than gee_common.py,
+# since that module pulls in the earth engine client just to be loaded.
 BLOCK_SIZE_M = 10_000
-NLCD_ORIGIN_X, NLCD_ORIGIN_Y = -2415585, 3314805
 
 # The probability grid a block's profile is sampled on. Trimmed off both ends:
 # below 0.025 and above 0.975 the quantile is set by a handful of pixels even
@@ -113,7 +114,7 @@ def sweep_path(shape_only: bool) -> str:
 def connect() -> duckdb.DuckDBPyConnection:
     """Plain view over the joined tiles.
 
-    Deliberately not gb_common.connect_raw(): that one LEFT JOINs the 388MB
+    Deliberately not model_common.connect_raw(): that one LEFT JOINs the 388MB
     neighborhood features table unconditionally, and none of those columns are
     wanted here. Straight off the glob, parquet column pruning reads 5 columns
     out of 203.

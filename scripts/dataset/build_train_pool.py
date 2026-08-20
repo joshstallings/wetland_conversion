@@ -25,7 +25,7 @@ reproduces the same split and the same draw:
       same row budget no matter where its distance distribution happens to
       sit. Requires a fold assignment already built under the same
       dataset-name. Writes
-      data/processed/datasets/<dataset-name>/gb_train_pool.parquet. Pass
+      data/processed/datasets/<dataset-name>/train_pool.parquet. Pass
       --with-neighborhood-features to add the columns `features` below
       builds to the draw.
 
@@ -37,7 +37,8 @@ reproduces the same split and the same draw:
       any one dataset-name, these are fixed properties of a pixel's
       surroundings, the same for every dataset built from the same raster.
       Writes data/processed/neighborhood_features.parquet, one row per
-      wetland sample pixel. See PLAN.md for the reasoning behind each
+      wetland sample pixel. See _local_density/_edge_mask/
+      _direction_to_nearest_developed below for the reasoning behind each
       feature and the approximations made to keep this affordable on a
       668 million pixel raster.
 
@@ -51,7 +52,7 @@ true label=0 population, and label=2 sits at p=1 and weight 1, so it
 represents exactly itself. That leaves the pos-weight-mult boost on label=1
 as the only place the pool departs from reality, which is what makes the
 model's scores recoverable back to real conversion probabilities with
-p_true = p / (p + pos_weight_mult * (1 - p)). scripts/gb_common.py's
+p_true = p / (p + pos_weight_mult * (1 - p)). scripts/model/model_common.py's
 calibrate() applies that correction before anything gets reported in
 probability units. Left unset, pos-weight-mult is derived rather than hand
 picked: n_neg_natural / n_pos_natural, the ratio that gives label=1 and
@@ -59,14 +60,14 @@ label!=1 equal total weight in the loss (natural_pos_weight_mult). Pass
 --pos-weight-mult to pin a specific value instead.
 
 Usage:
-    python scripts/build_train_pool.py features [--force]
-    python scripts/build_train_pool.py folds --dataset-name NAME [--force]
+    python -m scripts.dataset.build_train_pool features [--force]
+    python -m scripts.dataset.build_train_pool folds --dataset-name NAME [--force]
         [--k-folds 5] [--seed 0]
-    python scripts/build_train_pool.py pool --dataset-name NAME [--force]
+    python -m scripts.dataset.build_train_pool pool --dataset-name NAME [--force]
         [--tau-m 200.0] [--pos-row-dup 2] [--pos-weight-mult VALUE]
         [--rows-per-training-set 2500000] [--draw-seed 42]
         [--with-neighborhood-features]
-    python scripts/build_train_pool.py report --dataset-name NAME
+    python -m scripts.dataset.build_train_pool report --dataset-name NAME
 """
 
 import argparse
@@ -82,6 +83,8 @@ import rasterio
 from rasterio.windows import transform as window_transform
 from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt, uniform_filter
 
+from scripts.data_constants import ALPHAEARTH_DATASET, BAND_COLS, BUFFER_M, DEVELOPED_CLASSES
+
 JOINED_GLOB = "data/processed/alphaearth_wetland_joined/*.parquet"
 DATASETS_DIR = "data/processed/datasets"
 
@@ -92,11 +95,10 @@ STATE_BOUNDARY_SHP = "data/boundaries/cb_2023_us_state_500k/cb_2023_us_state_500
 SAMPLE_LABELS_PATH = "data/processed/wetland_sample_labels_2019_2024.parquet"
 NEIGHBORHOOD_FEATURES_PATH = "data/processed/neighborhood_features.parquet"
 
-# Same buffer wetland_sample_labels.ipynb reads the 2019 raster with. Has to
-# match exactly, this is what keeps a row, col pair pointing at the same
-# pixel here as it does in the sample table.
-BUFFER_M = 15_000
-DEVELOPED_CLASSES = (21, 22, 23, 24)
+# BUFFER_M and DEVELOPED_CLASSES come from data_constants.py, shared with
+# wetland_sample_labels.ipynb: BUFFER_M has to match exactly, it's what keeps
+# a row, col pair pointing at the same pixel here as it does in the sample
+# table built there.
 PIXEL_M = 30.0
 
 NEIGHBORHOOD_RADII_M = {"frac_dev_100m": 100.0, "frac_dev_300m": 300.0, "frac_dev_500m": 500.0}
@@ -146,7 +148,7 @@ MAX_SWAP_SWEEPS = 60
 SWAP_CANDIDATES = 220
 
 DIST_COL = "dist_to_developed_2019_m"
-BAND_COLS = [f"A{b:02d}_{year}" for year in (2017, 2018, 2019) for b in range(64)]
+# BAND_COLS comes from data_constants.py, shared with model_common.py.
 
 # Positives first: label=1 balance is what drives the variance in AP across
 # folds. Rows and label=2 matter too but they are worth less than getting the
@@ -337,6 +339,8 @@ def cmd_folds(args):
         "dataset_name": args.dataset_name,
         "k_folds": args.k_folds,
         "seed": args.seed,
+        "nlcd_release": os.path.basename(os.path.dirname(NLCD_2019_PATH)),
+        "alphaearth_dataset": ALPHAEARTH_DATASET,
     })
 
 
@@ -390,7 +394,7 @@ def natural_pos_weight_mult(fold_calib: pd.DataFrame) -> float:
 def cmd_pool(args):
     ddir = dataset_dir(args.dataset_name)
     block_folds_path = os.path.join(ddir, "block_folds.parquet")
-    train_pool_path = os.path.join(ddir, "gb_train_pool.parquet")
+    train_pool_path = os.path.join(ddir, "train_pool.parquet")
 
     if os.path.exists(train_pool_path) and not args.force:
         print(f"{train_pool_path} exists, use --force to rebuild")
@@ -474,6 +478,8 @@ def cmd_pool(args):
         "rows_per_fold": rows_per_fold,
         "draw_seed": args.draw_seed,
         "with_neighborhood_features": args.with_neighborhood_features,
+        "nlcd_release": os.path.basename(os.path.dirname(NLCD_2019_PATH)),
+        "alphaearth_dataset": ALPHAEARTH_DATASET,
     })
 
 
@@ -602,7 +608,7 @@ def _quantiles(con, table: str, where: str, tag: str) -> pd.DataFrame:
 def cmd_report(args):
     ddir = dataset_dir(args.dataset_name)
     block_folds_path = os.path.join(ddir, "block_folds.parquet")
-    train_pool_path = os.path.join(ddir, "gb_train_pool.parquet")
+    train_pool_path = os.path.join(ddir, "train_pool.parquet")
 
     cfg = load_config(args.dataset_name)
     print(f"== dataset '{args.dataset_name}'")

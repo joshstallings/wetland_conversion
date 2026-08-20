@@ -33,10 +33,10 @@ finishes more tiles, re-running `extract-all` then `assemble` picks up
 whatever's newly available and leaves everything else alone.
 
 Usage:
-    python scripts/join_alphaearth_samples.py extract-tile --tile-id r039_c056 --year 2017
-    python scripts/join_alphaearth_samples.py extract-all [--years 2017 2018 2019]
-    python scripts/join_alphaearth_samples.py assemble [--years 2017 2018 2019]
-    python scripts/join_alphaearth_samples.py status
+    python -m scripts.ingest.join_alphaearth_samples extract-tile --tile-id r039_c056 --year 2017
+    python -m scripts.ingest.join_alphaearth_samples extract-all [--years 2017 2018 2019]
+    python -m scripts.ingest.join_alphaearth_samples assemble [--years 2017 2018 2019]
+    python -m scripts.ingest.join_alphaearth_samples status
 """
 
 import argparse
@@ -48,8 +48,8 @@ import numpy as np
 import pandas as pd
 import rasterio
 
-from export_alphaearth_30m import NODATA, OFFSET, SCALE_FACTOR, local_tile_path
-from gee_common import NLCD_ORIGIN_X, NLCD_ORIGIN_Y, NLCD_PIXEL_M, TILE_SIZE_PX_30M
+from scripts.ingest.export_alphaearth_30m import NODATA, OFFSET, SCALE_FACTOR, local_tile_path
+from scripts.ingest.gee_common import NLCD_ORIGIN_X, NLCD_ORIGIN_Y, NLCD_PIXEL_M, TILE_SIZE_PX_30M
 
 SAMPLES_PATH = "data/processed/wetland_sample_labels_2019_2024.parquet"
 EXTRACT_DIR = "data/processed/alphaearth_extract"

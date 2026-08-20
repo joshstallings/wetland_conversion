@@ -25,22 +25,22 @@ three years of statewide data in the ~50GB range we're targeting. 0, unused
 by the shifted range, is the nodata fill for everything outside Florida.
 
 Usage:
-    python scripts/export_alphaearth_30m.py test-direct [--year 2019]
+    python -m scripts.ingest.export_alphaearth_30m test-direct [--year 2019]
         Small synchronous patch, no GCS/billing involved - confirms the
         reduceResolution/reproject/scale/dtype chain, and checks the output
         actually lands on the same pixel lattice as a real NLCD tif, before
         anything is submitted as a batch task.
 
-    python scripts/export_alphaearth_30m.py test-tile [--year 2019]
+    python -m scripts.ingest.export_alphaearth_30m test-tile [--year 2019]
         Submits one real tile through the actual GCS export path (bucket
         jstallings, prefix alphaearth_florida_30m/test/), so billing/bucket
         permissions/output get checked before going statewide. Not manifest-
         tracked - check it with `task <id>`, not `status`.
 
-    python scripts/export_alphaearth_30m.py task TASK_ID
+    python -m scripts.ingest.export_alphaearth_30m task TASK_ID
         Checks one task by id directly - for test-tile's task, or any other.
 
-    python scripts/export_alphaearth_30m.py validate-tile [--tile-id ID] [--year Y]
+    python -m scripts.ingest.export_alphaearth_30m validate-tile [--tile-id ID] [--year Y]
         Checks a real, already-downloaded export (defaults to whatever's
         already in data/AlphaEarth/) against a fresh synchronous
         recomputation of the same recipe for a small patch - confirms the
@@ -48,14 +48,14 @@ Usage:
         today, not just well-formed. Read-only, safe alongside a running
         submit batch.
 
-    python scripts/export_alphaearth_30m.py submit --years 2017 2018 2019 [--limit N]
+    python -m scripts.ingest.export_alphaearth_30m submit --years 2017 2018 2019 [--limit N]
         Submits the statewide batch, one task per (tile, year). Safe to
         re-run - tile-years already logged in the manifest are skipped.
 
-    python scripts/export_alphaearth_30m.py status
+    python -m scripts.ingest.export_alphaearth_30m status
         Polls task state for everything in the manifest.
 
-    python scripts/export_alphaearth_30m.py verify --years 2017 2018 2019
+    python -m scripts.ingest.export_alphaearth_30m verify --years 2017 2018 2019
         Stronger check than status: confirms every expected tile-year in the
         grid was actually submitted (not just what's already in the
         manifest - catches a submit run that got interrupted), flags any
@@ -75,7 +75,7 @@ import geopandas as gpd
 import requests
 from pyproj import Transformer
 
-from gee_common import (
+from scripts.ingest.gee_common import (
     NLCD_CRS_WKT,
     NLCD_ORIGIN_X,
     NLCD_ORIGIN_Y,
@@ -133,7 +133,7 @@ def load_grid():
     if not os.path.exists(TILE_GRID_30M_PATH):
         raise SystemExit(
             f"{TILE_GRID_30M_PATH} doesn't exist - run "
-            "scripts/build_florida_tile_grid_30m.py first"
+            "python -m scripts.ingest.build_florida_tile_grid_30m first"
         )
     return gpd.read_file(TILE_GRID_30M_PATH)  # already in NLCD_CRS_WKT
 
@@ -280,7 +280,7 @@ def cmd_test_tile(args):
     print(f"gs://{GCS_BUCKET}/{GCS_PREFIX}/test/{description}.tif")
     # not manifest-tracked (manifest is only for the resumable submit batch,
     # see cmd_submit), so `status` won't show this - check the task directly
-    print(f"poll with: python scripts/export_alphaearth_30m.py task {task.id}")
+    print(f"poll with: python -m scripts.ingest.export_alphaearth_30m task {task.id}")
 
 
 def cmd_validate_tile(args):

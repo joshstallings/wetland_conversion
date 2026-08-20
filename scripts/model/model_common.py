@@ -1,28 +1,35 @@
-"""Shared config and helpers for the gradient boosting pipeline: feature and
+"""Shared config and helpers for the modeling pipeline: feature and
 target column definitions, per fold distance normalization, the iter_folds
-generator, and the metric functions that scripts/gb_train.py, eda_dataset.ipynb,
-and model_analysis.ipynb all need against one chosen dataset (see
-scripts/build_train_pool.py for what a dataset is). Not runnable on its own,
-mirrors the role gee_common.py plays for the AlphaEarth export pipeline.
+generator, and the metric functions that scripts/model/train.py,
+eda_dataset.ipynb, and model_analysis.ipynb all need against one chosen
+dataset (see scripts/dataset/build_train_pool.py for what a dataset is).
+Not runnable on its own, mirrors the role gee_common.py plays for the
+AlphaEarth export pipeline.
 """
 
 import json
 import os
 
+from typing import Callable
+
 import duckdb
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import precision_recall_curve
+
+from scripts.data_constants import BAND_COLS
 
 JOINED_GLOB = "data/processed/alphaearth_wetland_joined/*.parquet"
 DATASETS_DIR = "data/processed/datasets"
 
-# Built once by `python scripts/build_train_pool.py features`, not tied to
+# Built once by `python -m scripts.dataset.build_train_pool features`, not tied to
 # any one dataset: the local development density, edge density, and
 # direction-to-nearest-development columns, one row per wetland sample
 # pixel. connect_raw() joins this onto `samples` unconditionally, same as
 # the AlphaEarth bands, so it needs to exist before anything in this module
-# runs. See PLAN.md for how each column is built.
+# runs. See build_train_pool.py's `features` subcommand for how each column
+# is built.
 NEIGHBORHOOD_FEATURES_PATH = "data/processed/neighborhood_features.parquet"
 NEIGHBORHOOD_FEATURE_COLS = [
     "frac_dev_100m", "frac_dev_300m", "frac_dev_500m", "edge_density_300m", "dev_dir_sin", "dev_dir_cos",
@@ -32,7 +39,7 @@ K_FOLDS = 5
 DIST_COL = "dist_to_developed_2019_m"
 DIST_NORM_COL = "dist_log_z"
 TARGET_COL = "label_bin"
-BAND_COLS = [f"A{b:02d}_{year}" for year in (2017, 2018, 2019) for b in range(64)]
+# BAND_COLS comes from data_constants.py, shared with build_train_pool.py.
 FEATURE_COLS = [DIST_NORM_COL] + BAND_COLS
 DIST_ONLY_FEATURE_COLS = [DIST_NORM_COL]
 # Distance, the neighborhood features, and every AlphaEarth band together.
@@ -94,7 +101,7 @@ def connect_raw() -> duckdb.DuckDBPyConnection:
     depend on any one generated dataset."""
     if not os.path.exists(NEIGHBORHOOD_FEATURES_PATH):
         raise SystemExit(f"{NEIGHBORHOOD_FEATURES_PATH} not found, run "
-                         f"`python scripts/build_train_pool.py features` first")
+                         f"`python -m scripts.dataset.build_train_pool features` first")
     con = duckdb.connect()
     con.execute(f"""
         CREATE OR REPLACE VIEW samples AS
@@ -121,7 +128,7 @@ def connect_samples(dataset_name: str) -> tuple[duckdb.DuckDBPyConnection, pd.Da
 
 
 def load_train_pool(dataset_name: str) -> pd.DataFrame:
-    return pd.read_parquet(os.path.join(dataset_dir(dataset_name), "gb_train_pool.parquet"))
+    return pd.read_parquet(os.path.join(dataset_dir(dataset_name), "train_pool.parquet"))
 
 
 def fit_dist_normalizer(con: duckdb.DuckDBPyConnection, fold_id: int) -> tuple[float, float]:
@@ -283,6 +290,85 @@ def sample_fold_with_xy(con: duckdb.DuckDBPyConnection, fold_id: int, n_rows: in
     df[DIST_NORM_COL] = (np.log1p(df[DIST_COL]) - log_mean) / log_std
     df[TARGET_COL] = (df["label"] == 1).astype(int)
     return df
+
+
+def decile_precision_recall(oof: pd.DataFrame, dist_edges: list[float], dist_labels: list[str],
+                            k_folds: int = K_FOLDS) -> pd.DataFrame:
+    """Precision and recall by distance-to-development decile, one row per
+    (fold, decile). Pulled out of model_analysis.ipynb so a non LightGBM
+    experiment gets the same breakdown for free: this only touches oof's
+    label/y_score/DIST_COL columns, nothing model specific.
+
+    Each fold classifies at its own best F1 threshold, recovered fresh from
+    its out of fold precision_recall_curve rather than refit, the same
+    operating point fold_summary's precision/recall columns already report.
+    Bins with no positives to recall, or no predicted positives to score
+    precision on, come back as NaN rather than a misleading zero.
+    """
+    rows = []
+    for fold_id in range(k_folds):
+        sub = oof[oof["fold"] == fold_id]
+        y_test = sub["label"].to_numpy()
+        proba = sub["y_score"].to_numpy()
+        dist = sub[DIST_COL].to_numpy()
+
+        precision_curve, recall_curve, pr_thresholds = precision_recall_curve(y_test, proba)
+        best_threshold, _, _, _ = best_f1_operating_point(precision_curve, recall_curve, pr_thresholds)
+        y_pred = proba >= best_threshold
+
+        bin_idx = np.digitize(dist, dist_edges)
+        for b in range(len(dist_labels)):
+            in_bin = bin_idx == b
+            tp = int(np.sum(y_pred[in_bin] & (y_test[in_bin] == 1)))
+            fp = int(np.sum(y_pred[in_bin] & (y_test[in_bin] == 0)))
+            fn = int(np.sum(~y_pred[in_bin] & (y_test[in_bin] == 1)))
+            rows.append({
+                "fold": fold_id, "decile": b, "label": dist_labels[b],
+                "n": int(in_bin.sum()), "n_pos": tp + fn,
+                "precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+                "recall": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def spatial_fold_predictions(con: duckdb.DuckDBPyConnection, score_fns: dict[int, Callable[[pd.DataFrame], np.ndarray]],
+                             fold_summary: pd.DataFrame, dataset_config: dict, k_folds: int = K_FOLDS,
+                             rows_per_fold: int = 100_000) -> pd.DataFrame:
+    """Deterministic spatial subsample of every fold, scored out of fold and
+    tagged true/false positive/negative against each fold's own best F1
+    threshold. Also pulled out of model_analysis.ipynb.
+
+    score_fns[fold_id] is the one model specific piece: a callable from a
+    feature frame to a raw, uncalibrated positive class score. For a
+    LightGBM fold model that's `lambda df: model.predict_proba(df[cols])[:, 1]`;
+    a DL model plugs in its own batched inference the same way. Everything
+    after that (the sample_fold_with_xy draw, calibrate(), thresholding at
+    fold_summary's best_threshold, the outcome tagging) is the same either
+    way, since it only ever sees the score, not what produced it.
+    """
+    frames = []
+    for fold_id in range(k_folds):
+        log_mean, log_std = fit_dist_normalizer(con, fold_id)
+        df = sample_fold_with_xy(con, fold_id, rows_per_fold, log_mean, log_std)
+        proba = score_fns[fold_id](df)
+        df["score"] = calibrate(proba, dataset_config["pos_weight_mult"])
+        df["y_pred"] = (df["score"] >= fold_summary.loc[fold_id, "best_threshold"]).astype(int)
+        frames.append(df[["x", "y", "label", TARGET_COL, "score", "y_pred"]])
+        del df, proba
+
+    predictions = pd.concat(frames, ignore_index=True)
+    # tag each pixel once so a caller plotting multiple error panels doesn't
+    # recompute this per panel
+    predictions["outcome"] = np.select(
+        [
+            (predictions[TARGET_COL] == 1) & (predictions["y_pred"] == 1),
+            (predictions[TARGET_COL] == 0) & (predictions["y_pred"] == 1),
+            (predictions[TARGET_COL] == 1) & (predictions["y_pred"] == 0),
+        ],
+        ["true_positive", "false_positive", "false_negative"],
+        default="true_negative",
+    )
+    return predictions
 
 
 def iter_folds(con: duckdb.DuckDBPyConnection, train_pool: pd.DataFrame,

@@ -1,5 +1,6 @@
 data/*
 .claude/
 CLAUDE.md
-scripts/__pycache__
+**/__pycache__
 results/models
+.DS_Store

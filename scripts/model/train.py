@@ -1,6 +1,6 @@
-"""Fit and persist gradient boosting models for a named experiment (see
-scripts/experiments.py), and screen hyperparameters against one held out
-fold. Everything an experiment produces lives under
+"""Fit and persist models for a named experiment (see scripts/model/experiments.py),
+and screen hyperparameters against one held out fold. Everything an experiment
+produces lives under
 results/models/<experiment_name>/, and a fold's model, once fit, is never
 implicitly retrained: baseline writes one joblib file per fold, plus the out
 of fold predictions every downstream analysis needs, so
@@ -18,7 +18,7 @@ model_analysis.ipynb only ever loads from disk.
       across all folds.
 
   grid-search
-      Screens an experiment's grid (scripts/experiments.py) against a single
+      Screens an experiment's grid (scripts/model/experiments.py) against a single
       fold pair: fold 0 held out as the screening test, fold 1 as an early
       stopping validation set pulled from the natural distribution, the rest
       as training data. A full grid across a full k fold CV would be far too
@@ -48,10 +48,10 @@ model_analysis.ipynb only ever loads from disk.
       are complete.
 
 Usage:
-    python scripts/gb_train.py baseline --experiment NAME [--force]
-    python scripts/gb_train.py grid-search --experiment NAME [--force]
-    python scripts/gb_train.py grid-finalize --experiment NAME [--run run_NNN]
-    python scripts/gb_train.py status --experiment NAME
+    python -m scripts.model.train baseline --experiment NAME [--force]
+    python -m scripts.model.train grid-search --experiment NAME [--force]
+    python -m scripts.model.train grid-finalize --experiment NAME [--run run_NNN]
+    python -m scripts.model.train status --experiment NAME
 """
 
 import argparse
@@ -76,8 +76,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-import experiments
-import gb_common
+from scripts.model import experiments, model_common, dl_models
 
 
 def make_model(cfg: experiments.ExperimentConfig, **overrides):
@@ -86,6 +85,9 @@ def make_model(cfg: experiments.ExperimentConfig, **overrides):
     params = {**cfg.model_params, **overrides}
     if cfg.model_type == "lightgbm":
         return lgb.LGBMClassifier(**params)
+    elif cfg.model_type == "slm":
+        return dl_models.SimpleLinearModel(n_features=len(cfg.feature_cols))
+    
     raise ValueError(f"unknown model_type '{cfg.model_type}'")
 
 
@@ -98,14 +100,14 @@ def _binary_metrics(y_test: np.ndarray, proba: np.ndarray, pos_weight_mult: floa
     pr_auc = auc(recall, precision)
     fpr, tpr, _ = roc_curve(y_test, proba)
     roc_auc = roc_auc_score(y_test, proba)
-    best_threshold, best_p, best_r, best_f1 = gb_common.best_f1_operating_point(precision, recall, pr_thresholds)
+    best_threshold, best_p, best_r, best_f1 = model_common.best_f1_operating_point(precision, recall, pr_thresholds)
     accuracy = accuracy_score(y_test, proba >= best_threshold)
 
     metrics = {
         "avg_precision": avg_prec, "pr_auc": pr_auc, "accuracy": accuracy, "roc_auc": roc_auc,
         "precision": best_p, "recall": best_r, "f1": best_f1,
         # calibrated, so this threshold means the same thing wherever it's read back
-        "best_threshold": float(gb_common.calibrate(np.array([best_threshold]), pos_weight_mult)[0]),
+        "best_threshold": float(model_common.calibrate(np.array([best_threshold]), pos_weight_mult)[0]),
     }
     curves = {"fpr": fpr, "tpr": tpr, "recall_curve": recall, "precision_curve": precision}
     return metrics, curves
@@ -119,39 +121,50 @@ def cmd_baseline(args):
         return
     os.makedirs(baseline_dir, exist_ok=True)
 
-    dcfg = gb_common.load_dataset_config(cfg.dataset_name)
+    dcfg = model_common.load_dataset_config(cfg.dataset_name)
     pos_weight_mult = dcfg["pos_weight_mult"]
     pos_row_dup = dcfg["pos_row_dup"]
-    k_folds = dcfg.get("k_folds", gb_common.K_FOLDS)
+    k_folds = dcfg.get("k_folds", model_common.K_FOLDS)
 
-    con, _ = gb_common.connect_samples(cfg.dataset_name)
-    train_pool = gb_common.load_train_pool(cfg.dataset_name)
+    con, _ = model_common.connect_samples(cfg.dataset_name)
+    train_pool = model_common.load_train_pool(cfg.dataset_name)
     model_factory = lambda: make_model(cfg)  # noqa: E731, reused per fold by iter_folds' calibrator
 
     fold_metrics = []
     roc_curves, pr_curves = {}, {}
     oof_frames = []
 
-    for fold_id, X_train, y_train, w_train, _predict_test, make_calibrator in gb_common.iter_folds(
+    for fold_id, X_train, y_train, w_train, _predict_test, make_calibrator in model_common.iter_folds(
         con, train_pool, pos_weight_mult, pos_row_dup, k=k_folds,
     ):
         model = make_model(cfg)
-        model.fit(X_train[cfg.feature_cols], y_train, sample_weight=w_train)
+
+        # This necessary because slm uses a stratified batch sampler that 
+        # will ensure a certain number of positives are in a batch. 
+        # If we didn't pass the natural weights, then, there would be 'double counting' as the model sees the
+        # boosted weights + the positives multiple times. 
+        fit_weight = (
+                model_common.natural_weights(X_train, pos_weight_mult, pos_row_dup)
+                if cfg.model_type == "slm" else w_train
+        )
+        model.fit(X_train[cfg.feature_cols], y_train, sample_weight=fit_weight)
+
+        # Save the model to disk. 
         joblib.dump(model, os.path.join(baseline_dir, f"model_fold{fold_id}.joblib"))
 
         # one streamed pass over the held out fold covers both the metrics
         # below and the decile analysis model_analysis.ipynb does later, so
         # oof_predictions.parquet carries distance too and that notebook
         # never has to re-score the fold from scratch
-        log_mean, log_std = gb_common.fit_dist_normalizer(con, fold_id)
-        y_test, proba, dist = gb_common.predict_fold_with_dist(
+        log_mean, log_std = model_common.fit_dist_normalizer(con, fold_id)
+        y_test, proba, dist = model_common.predict_fold_with_dist(
             con, model, fold_id, log_mean, log_std, cfg.feature_cols)
-        p_cal = gb_common.calibrate(proba, pos_weight_mult)
+        p_cal = model_common.calibrate(proba, pos_weight_mult)
         p_iso = make_calibrator(model_factory, cfg.feature_cols).predict(proba)
 
         metrics, curves = _binary_metrics(y_test, proba, pos_weight_mult)
-        pred_acres = float(p_cal.sum() * gb_common.PIXEL_ACRES)
-        actual_acres = float(y_test.sum() * gb_common.PIXEL_ACRES)
+        pred_acres = float(p_cal.sum() * model_common.PIXEL_ACRES)
+        actual_acres = float(y_test.sum() * model_common.PIXEL_ACRES)
         fold_metrics.append({
             "fold": fold_id, **metrics,
             "prevalence": float(y_test.mean()),
@@ -165,7 +178,7 @@ def cmd_baseline(args):
         oof_frames.append(pd.DataFrame({
             "fold": np.full(len(y_test), fold_id, dtype=np.int8),
             "label": y_test.astype(np.int8),
-            gb_common.DIST_COL: dist.astype(np.float32),
+            model_common.DIST_COL: dist.astype(np.float32),
             "y_score": proba.astype(np.float32),
             "p_calibrated": p_cal.astype(np.float32),
         }))
@@ -175,7 +188,7 @@ def cmd_baseline(args):
               f"{actual_acres:,.0f} actual ({100 * (pred_acres / actual_acres - 1):+.1f}%)")
         del model, X_train, y_train, w_train, y_test, proba, dist, p_cal, p_iso
 
-    fold_summary = pd.DataFrame(fold_metrics).set_index("fold")[gb_common.SUMMARY_COLS + gb_common.CALIB_COLS]
+    fold_summary = pd.DataFrame(fold_metrics).set_index("fold")[model_common.SUMMARY_COLS + model_common.CALIB_COLS]
     fold_summary = pd.concat([fold_summary, fold_summary.agg(["mean", "std"])])
     fold_summary.to_csv(os.path.join(baseline_dir, "fold_summary.csv"))
     print(fold_summary.to_string(float_format=lambda v: f"{v:,.4f}"))
@@ -257,15 +270,15 @@ def grid_split(cfg: experiments.ExperimentConfig, con, train_pool: pd.DataFrame,
     train_folds = [f for f in range(k_folds) if f not in (screen_fold, val_fold)]
     val_rows = 1_000_000
 
-    log_mean, log_std = gb_common.fit_dist_normalizer_excluding(con, [screen_fold, val_fold])
-    fit_frame = train_pool[train_pool["fold"].isin(train_folds)].pipe(gb_common.add_normalized_dist, log_mean, log_std)
+    log_mean, log_std = model_common.fit_dist_normalizer_excluding(con, [screen_fold, val_fold])
+    fit_frame = train_pool[train_pool["fold"].isin(train_folds)].pipe(model_common.add_normalized_dist, log_mean, log_std)
     X_fit = fit_frame[cfg.feature_cols]
-    y_fit = fit_frame[gb_common.TARGET_COL]
+    y_fit = fit_frame[model_common.TARGET_COL]
     w_fit = fit_frame["sample_weight"] / fit_frame["sample_weight"].mean()
 
-    val_frame = gb_common.natural_fold_sample(con, val_fold, val_rows, log_mean, log_std)
+    val_frame = model_common.natural_fold_sample(con, val_fold, val_rows, log_mean, log_std)
     X_val = val_frame[cfg.feature_cols]
-    y_val = val_frame[gb_common.TARGET_COL]
+    y_val = val_frame[model_common.TARGET_COL]
 
     return X_fit, y_fit, w_fit, X_val, y_val, screen_fold, val_fold, train_folds, log_mean, log_std
 
@@ -273,17 +286,17 @@ def grid_split(cfg: experiments.ExperimentConfig, con, train_pool: pd.DataFrame,
 def cmd_grid_search(args):
     cfg = experiments.get(args.experiment)
     if cfg.grid is None:
-        raise SystemExit(f"experiment '{args.experiment}' has no grid configured in scripts/experiments.py")
+        raise SystemExit(f"experiment '{args.experiment}' has no grid configured in scripts/model/experiments.py")
 
     grid_dir = os.path.join(cfg.results_dir, "grid_search")
     os.makedirs(grid_dir, exist_ok=True)
 
-    dcfg = gb_common.load_dataset_config(cfg.dataset_name)
+    dcfg = model_common.load_dataset_config(cfg.dataset_name)
     pos_weight_mult = dcfg["pos_weight_mult"]
-    k_folds = dcfg.get("k_folds", gb_common.K_FOLDS)
+    k_folds = dcfg.get("k_folds", model_common.K_FOLDS)
 
-    con, _ = gb_common.connect_samples(cfg.dataset_name)
-    train_pool = gb_common.load_train_pool(cfg.dataset_name)
+    con, _ = model_common.connect_samples(cfg.dataset_name)
+    train_pool = model_common.load_train_pool(cfg.dataset_name)
 
     X_fit, y_fit, w_fit, X_val, y_val, screen_fold, val_fold, train_folds, log_mean, log_std = grid_split(
         cfg, con, train_pool, k_folds)
@@ -324,7 +337,7 @@ def cmd_grid_search(args):
                     stopping_rounds=params["early_stopping_rounds"], first_metric_only=True, verbose=False)],
             )
 
-            y_test, proba = gb_common.predict_fold(con, model, screen_fold, log_mean, log_std, cfg.feature_cols)
+            y_test, proba = model_common.predict_fold(con, model, screen_fold, log_mean, log_std, cfg.feature_cols)
             metrics, curves = _binary_metrics(y_test, proba, pos_weight_mult)
 
             with open(os.path.join(run_dir, "params.txt"), "w") as f:
@@ -336,7 +349,7 @@ def cmd_grid_search(args):
                 f.write(f"train_folds={','.join(map(str, train_folds))}\n")
                 f.write(f"best_iteration={model.best_iteration_}\n")
 
-            pd.DataFrame([metrics])[gb_common.SUMMARY_COLS].to_csv(metrics_path, index=False)
+            pd.DataFrame([metrics])[model_common.SUMMARY_COLS].to_csv(metrics_path, index=False)
             _save_run_plots(run_dir, run_id, screen_fold, curves, metrics["avg_precision"], metrics["roc_auc"])
 
             grid_summary_rows.append({"run_id": run_id, **params, "best_iteration": model.best_iteration_, **metrics})
@@ -394,10 +407,10 @@ def cmd_grid_finalize(args):
     if not os.path.exists(run_dir):
         raise SystemExit(f"{run_dir} not found")
 
-    dcfg = gb_common.load_dataset_config(cfg.dataset_name)
-    k_folds = dcfg.get("k_folds", gb_common.K_FOLDS)
-    con, _ = gb_common.connect_samples(cfg.dataset_name)
-    train_pool = gb_common.load_train_pool(cfg.dataset_name)
+    dcfg = model_common.load_dataset_config(cfg.dataset_name)
+    k_folds = dcfg.get("k_folds", model_common.K_FOLDS)
+    con, _ = model_common.connect_samples(cfg.dataset_name)
+    train_pool = model_common.load_train_pool(cfg.dataset_name)
 
     # rebuild the exact frame this run was screened on, so a refit (if one
     # is needed below) reproduces it, and so the natural fold scoring further
@@ -476,7 +489,7 @@ def cmd_grid_finalize(args):
     fold_rows = []
     fold_pr_curves = {}
     for fold_id in range(k_folds):
-        y_true, y_score = gb_common.predict_fold(con, model, fold_id, log_mean, log_std, cfg.feature_cols)
+        y_true, y_score = model_common.predict_fold(con, model, fold_id, log_mean, log_std, cfg.feature_cols)
         pred = (y_score >= 0.5).astype(int)
         row = {
             "fold": fold_id,
@@ -504,7 +517,7 @@ def cmd_grid_finalize(args):
 
     fig, ax = plt.subplots(figsize=(6, 6))
     for fold_id, (r_curve, p_curve, avg_prec_fold) in fold_pr_curves.items():
-        ax.plot(r_curve, p_curve, color=gb_common.FOLD_COLORS[fold_id],
+        ax.plot(r_curve, p_curve, color=model_common.FOLD_COLORS[fold_id],
                 label=f"fold {fold_id} ({role_by_fold[fold_id]}, AP {avg_prec_fold:.3f})")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
@@ -528,9 +541,9 @@ def cmd_status(args):
     if os.path.exists(os.path.join(baseline_dir, "fold_summary.csv")):
         n_models = sum(
             os.path.exists(os.path.join(baseline_dir, f"model_fold{k}.joblib"))
-            for k in range(gb_common.K_FOLDS)
+            for k in range(model_common.K_FOLDS)
         )
-        print(f"  baseline: done ({n_models}/{gb_common.K_FOLDS} fold models on disk)")
+        print(f"  baseline: done ({n_models}/{model_common.K_FOLDS} fold models on disk)")
     else:
         print("  baseline: not run")
 

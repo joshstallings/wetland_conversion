@@ -9,17 +9,18 @@ Each stage reads the previous stage's output off disk, so any stage can be rerun
 on its own once the one before it exists.
 
 1. `wetland_sample_labels.ipynb` builds the label table from NLCD land cover.
-2. `scripts/export_alphaearth_30m.py` and `scripts/join_alphaearth_samples.py`
-   pull Google AlphaEarth embeddings and join them onto the labels.
-3. `scripts/build_train_pool.py` builds a named, versioned dataset: a spatial
-   fold assignment and a weighted training pool, under
+2. `scripts/ingest/export_alphaearth_30m.py` and
+   `scripts/ingest/join_alphaearth_samples.py` pull Google AlphaEarth
+   embeddings and join them onto the labels.
+3. `scripts/dataset/build_train_pool.py` builds a named, versioned dataset: a
+   spatial fold assignment and a weighted training pool, under
    `data/processed/datasets/<name>/`. Its `features` subcommand also builds a
    shared cache of neighborhood features straight from the 2019 NLCD raster
    (local development density, edge density, direction to development), see
-   `PLAN.md` for what each one is and why.
+   `scripts/README.md` for what each one is and why.
 4. `eda_dataset.ipynb` explores the joined table and any one built dataset.
-5. `scripts/gb_train.py` fits and persists gradient boosting models for a named
-   experiment (`scripts/experiments.py`), under `results/models/<name>/`.
+5. `scripts/model/train.py` fits and persists models for a named experiment
+   (`scripts/model/experiments.py`), under `results/models/<name>/`.
 6. `model_analysis.ipynb` loads a trained experiment's models and predictions
    and produces diagnostic figures, no retraining.
 
@@ -29,9 +30,11 @@ on its own once the one before it exists.
   `data/AlphaEarth/`, plus `data/processed/`, the joined per pixel table and
   `data/processed/datasets/<name>/`, one versioned training pool per named
   dataset. See `scripts/README.md` for what builds each file.
-- `scripts/` : the data and modeling pipeline, run from the repo root as
-  `python scripts/<name>.py ...`. See `scripts/README.md` for what each script
-  does.
+- `scripts/` : the data and modeling pipeline, a real Python package grouped
+  by stage (`ingest/`, `dataset/`, `model/`, plus `data_constants.py` shared
+  by all three), run from the repo root as
+  `python -m scripts.<stage>.<name> ...`. See `scripts/README.md` for what
+  each script does.
 - `results/models/<name>/` : everything one trained experiment produced,
   fold models, metrics, figures, and hyperparameter grid search runs.
 - `wetland_sample_labels.ipynb` : builds the label set for wetlands that
@@ -44,9 +47,6 @@ on its own once the one before it exists.
 - `model_analysis.ipynb` : diagnostics for one trained experiment, decile
   precision and recall by distance to development, spatial error maps, all
   loaded from disk with no retraining. Set `EXPERIMENT_NAME` at the top.
-- `gradient_boosting.ipynb` : the original, single notebook version of the
-  modeling work above. Superseded by the files listed above, kept for
-  reference.
 
 # Requirements
 

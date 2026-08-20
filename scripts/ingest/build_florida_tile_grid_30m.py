@@ -16,13 +16,13 @@ less data per unit area than float32 at 10m, so far fewer, larger tiles cover
 the state without inflating any single export task.
 
 Run once (or whenever TILE_SIZE_PX_30M changes):
-    python scripts/build_florida_tile_grid_30m.py
+    python -m scripts.ingest.build_florida_tile_grid_30m
 """
 
 import geopandas as gpd
 from shapely.geometry import box
 
-from gee_common import (
+from scripts.ingest.gee_common import (
     NLCD_CRS_WKT,
     NLCD_ORIGIN_X,
     NLCD_ORIGIN_Y,
