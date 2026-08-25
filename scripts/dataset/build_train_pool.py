@@ -14,7 +14,10 @@ reproduces the same split and the same draw:
       the per fold AP numbers were not comparable to each other. A greedy
       pass gets it roughly right, then pairwise swaps between folds close the
       rest of the gap. Writes
-      data/processed/datasets/<dataset-name>/block_folds.parquet.
+      data/processed/datasets/<dataset-name>/block_folds.parquet. Pass
+      --cluster-file and --cluster to restrict the block universe to one
+      block_distance_profiles.py cluster before assigning folds, e.g. to
+      build a dataset out of just the near-development regime (cluster 0).
 
   pool
       Draws the training pool. Every label=1 and label=2 pixel is kept,
@@ -23,8 +26,11 @@ reproduces the same split and the same draw:
       concentrates where conversion actually happens. Each fold gets its own
       decay constant A_k, solved in closed form so every fold contributes the
       same row budget no matter where its distance distribution happens to
-      sit. Requires a fold assignment already built under the same
-      dataset-name. Writes
+      sit. Pass --no-thinning to skip the decay draw entirely and keep every
+      label=0 pixel instead, useful once the block universe (via
+      --cluster-file/--cluster) is already small enough that there's nothing
+      left to thin. Requires a fold assignment already built under the same
+      dataset-name, with the same --cluster-file/--cluster if any. Writes
       data/processed/datasets/<dataset-name>/train_pool.parquet. Pass
       --with-neighborhood-features to add the columns `features` below
       builds to the draw.
@@ -62,11 +68,11 @@ label!=1 equal total weight in the loss (natural_pos_weight_mult). Pass
 Usage:
     python -m scripts.dataset.build_train_pool features [--force]
     python -m scripts.dataset.build_train_pool folds --dataset-name NAME [--force]
-        [--k-folds 5] [--seed 0]
+        [--k-folds 5] [--seed 0] [--cluster-file PATH --cluster N]
     python -m scripts.dataset.build_train_pool pool --dataset-name NAME [--force]
         [--tau-m 200.0] [--pos-row-dup 2] [--pos-weight-mult VALUE]
-        [--rows-per-training-set 2500000] [--draw-seed 42]
-        [--with-neighborhood-features]
+        [--rows-per-training-set 2500000] [--draw-seed 42] [--no-thinning]
+        [--with-neighborhood-features] [--cluster-file PATH --cluster N]
     python -m scripts.dataset.build_train_pool report --dataset-name NAME
 """
 
@@ -189,8 +195,17 @@ def save_config(dataset_name: str, updates: dict) -> None:
         json.dump(cfg, f, indent=2, sort_keys=True)
 
 
-def connect(with_neighborhood_features: bool = False) -> duckdb.DuckDBPyConnection:
+def connect(with_neighborhood_features: bool = False,
+            block_filter: pd.DataFrame | None = None) -> duckdb.DuckDBPyConnection:
+    """samples view over the joined tiles. Pass block_filter (a block_id
+    column, see load_cluster_blocks) to restrict it to one
+    block_distance_profiles.py cluster before anything downstream runs off
+    it, e.g. building a dataset out of just the near-development regime."""
     con = duckdb.connect()
+    filter_join = ""
+    if block_filter is not None:
+        con.register("block_filter", block_filter[["block_id"]])
+        filter_join = "JOIN block_filter bf USING (block_id)"
     if with_neighborhood_features:
         if not os.path.exists(NEIGHBORHOOD_FEATURES_PATH):
             raise SystemExit(f"{NEIGHBORHOOD_FEATURES_PATH} not found, run `build_train_pool.py features` first")
@@ -200,10 +215,28 @@ def connect(with_neighborhood_features: bool = False) -> duckdb.DuckDBPyConnecti
             FROM read_parquet('{JOINED_GLOB}') s
             LEFT JOIN read_parquet('{NEIGHBORHOOD_FEATURES_PATH}') nf
                 ON s."row" = nf."row" AND s."col" = nf."col"
+            {filter_join}
         """)
     else:
-        con.execute(f"CREATE OR REPLACE VIEW samples AS SELECT * FROM read_parquet('{JOINED_GLOB}')")
+        con.execute(f"""
+            CREATE OR REPLACE VIEW samples AS
+            SELECT * FROM read_parquet('{JOINED_GLOB}') s
+            {filter_join}
+        """)
     return con
+
+
+def load_cluster_blocks(cluster_file: str, cluster: int) -> pd.DataFrame:
+    """block_id set for one block_distance_profiles.py cluster, e.g. cluster 0,
+    the regime closest to development by that script's centroid ordering."""
+    if not os.path.exists(cluster_file):
+        raise SystemExit(f"{cluster_file} not found, run "
+                         f"`python -m scripts.dataset.block_distance_profiles cluster` first")
+    clusters = pd.read_parquet(cluster_file)
+    blocks = clusters.loc[clusters["cluster"] == cluster, ["block_id"]]
+    if blocks.empty:
+        raise SystemExit(f"no blocks with cluster == {cluster} in {cluster_file}")
+    return blocks
 
 
 def attach_folds(con: duckdb.DuckDBPyConnection, block_folds_path: str) -> pd.DataFrame:
@@ -310,13 +343,21 @@ def fold_summary(stats: pd.DataFrame) -> pd.DataFrame:
 
 
 def cmd_folds(args):
+    if (args.cluster_file is None) != (args.cluster is None):
+        raise SystemExit("--cluster-file and --cluster must be passed together")
+
     ddir = dataset_dir(args.dataset_name)
     block_folds_path = os.path.join(ddir, "block_folds.parquet")
     if os.path.exists(block_folds_path) and not args.force:
         print(f"{block_folds_path} exists, use --force to rebuild")
         return
 
-    con = connect()
+    block_filter = None
+    if args.cluster is not None:
+        block_filter = load_cluster_blocks(args.cluster_file, args.cluster)
+        print(f"restricting to cluster {args.cluster} ({len(block_filter)} blocks) from {args.cluster_file}")
+
+    con = connect(block_filter=block_filter)
     print("aggregating blocks...")
     stats = block_stats(con)
     print(f"  {len(stats)} blocks, {stats['n'].sum():,} rows, "
@@ -341,6 +382,8 @@ def cmd_folds(args):
         "seed": args.seed,
         "nlcd_release": os.path.basename(os.path.dirname(NLCD_2019_PATH)),
         "alphaearth_dataset": ALPHAEARTH_DATASET,
+        "cluster_file": args.cluster_file,
+        "cluster": args.cluster,
     })
 
 
@@ -375,6 +418,21 @@ def fold_calibration(con: duckdb.DuckDBPyConnection, tau_m: float, p_floor: floa
     return agg
 
 
+def natural_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Per fold natural label counts. The light half of what fold_calibration
+    computes, no decay constant to solve, for --no-thinning's straight
+    keep-everything draw."""
+    return con.execute("""
+        SELECT fold, COUNT(*) AS n,
+               SUM(CASE WHEN label = 1 THEN 1 ELSE 0 END) AS n1,
+               SUM(CASE WHEN label = 2 THEN 1 ELSE 0 END) AS n2,
+               SUM(CASE WHEN label = 0 THEN 1 ELSE 0 END) AS n0
+        FROM samples_fold
+        GROUP BY fold
+        ORDER BY fold
+    """).df()
+
+
 def natural_pos_weight_mult(fold_calib: pd.DataFrame) -> float:
     """n_neg_natural / n_pos_natural before any subsampling, i.e. the classic
     scale_pos_weight ratio: weighting each label=1 row by this much makes the
@@ -392,6 +450,9 @@ def natural_pos_weight_mult(fold_calib: pd.DataFrame) -> float:
 
 
 def cmd_pool(args):
+    if (args.cluster_file is None) != (args.cluster is None):
+        raise SystemExit("--cluster-file and --cluster must be passed together")
+
     ddir = dataset_dir(args.dataset_name)
     block_folds_path = os.path.join(ddir, "block_folds.parquet")
     train_pool_path = os.path.join(ddir, "train_pool.parquet")
@@ -407,12 +468,27 @@ def cmd_pool(args):
     k_folds = cfg["k_folds"]
     rows_per_fold = args.rows_per_training_set // (k_folds - 1)
 
-    con = connect(with_neighborhood_features=args.with_neighborhood_features)
+    block_filter = None
+    if args.cluster is not None:
+        block_filter = load_cluster_blocks(args.cluster_file, args.cluster)
+        print(f"restricting to cluster {args.cluster} ({len(block_filter)} blocks) from {args.cluster_file}")
+
+    con = connect(with_neighborhood_features=args.with_neighborhood_features, block_filter=block_filter)
     attach_folds(con, block_folds_path)
 
-    calib = fold_calibration(con, args.tau_m, P_FLOOR, args.pos_row_dup, rows_per_fold)
+    # --no-thinning skips the exponential distance decay draw and keeps every
+    # label=0 pixel, so there's no per fold decay constant A to solve for.
+    if args.no_thinning:
+        calib = natural_counts(con)
+        p_include_expr = "1.0"
+        join_calib = ""
+    else:
+        calib = fold_calibration(con, args.tau_m, P_FLOOR, args.pos_row_dup, rows_per_fold)
+        con.register("fold_calib", calib[["fold", "A"]])
+        p_include_expr = (f"CASE WHEN s.label IN (1, 2) THEN 1.0 ELSE "
+                          f"LEAST(1.0, {P_FLOOR} + c.A * EXP(-s.{DIST_COL} / {args.tau_m})) END")
+        join_calib = "JOIN fold_calib c USING (fold)"
     print(calib.to_string(index=False, float_format=lambda v: f"{v:,.5f}"))
-    con.register("fold_calib", calib[["fold", "A"]])
 
     pos_weight_mult = args.pos_weight_mult
     if pos_weight_mult is None:
@@ -438,12 +514,10 @@ def cmd_pool(args):
         COPY (
             WITH scored AS (
                 SELECT s.*,
-                       CASE WHEN s.label IN (1, 2) THEN 1.0
-                            ELSE LEAST(1.0, {P_FLOOR} + c.A * EXP(-s.{DIST_COL} / {args.tau_m}))
-                       END AS p_include,
+                       {p_include_expr} AS p_include,
                        (hash(s."row", s."col", {args.draw_seed}) % 1073741824) / 1073741824.0 AS u
                 FROM samples_fold s
-                JOIN fold_calib c USING (fold)
+                {join_calib}
             ),
             drawn AS (
                 SELECT *,
@@ -470,14 +544,19 @@ def cmd_pool(args):
 
     save_config(args.dataset_name, {
         "dataset_name": args.dataset_name,
-        "tau_m": args.tau_m,
-        "p_floor": P_FLOOR,
+        "no_thinning": args.no_thinning,
+        # moot once --no-thinning skips the decay draw; null them out rather
+        # than record defaults that were never actually used
+        "tau_m": None if args.no_thinning else args.tau_m,
+        "p_floor": None if args.no_thinning else P_FLOOR,
+        "rows_per_training_set": None if args.no_thinning else args.rows_per_training_set,
+        "rows_per_fold": None if args.no_thinning else rows_per_fold,
+        "draw_seed": None if args.no_thinning else args.draw_seed,
         "pos_row_dup": args.pos_row_dup,
         "pos_weight_mult": pos_weight_mult,
-        "rows_per_training_set": args.rows_per_training_set,
-        "rows_per_fold": rows_per_fold,
-        "draw_seed": args.draw_seed,
         "with_neighborhood_features": args.with_neighborhood_features,
+        "cluster_file": args.cluster_file,
+        "cluster": args.cluster,
         "nlcd_release": os.path.basename(os.path.dirname(NLCD_2019_PATH)),
         "alphaearth_dataset": ALPHAEARTH_DATASET,
     })
@@ -678,6 +757,11 @@ def main():
     p_f.add_argument("--force", action="store_true")
     p_f.add_argument("--k-folds", type=int, default=K_FOLDS)
     p_f.add_argument("--seed", type=int, default=SEED)
+    p_f.add_argument("--cluster-file", default=None,
+                     help="block_distance_profiles.py cluster assignment parquet; pass with "
+                          "--cluster to restrict the block universe to one cluster")
+    p_f.add_argument("--cluster", type=int, default=None,
+                     help="cluster id to restrict to, e.g. 0 for the near-development regime")
     p_f.set_defaults(func=cmd_folds)
 
     p_p = sub.add_parser("pool")
@@ -691,6 +775,13 @@ def main():
     p_p.add_argument("--rows-per-training-set", type=int, default=ROWS_PER_TRAINING_SET)
     p_p.add_argument("--draw-seed", type=int, default=DRAW_SEED)
     p_p.add_argument("--with-neighborhood-features", action="store_true")
+    p_p.add_argument("--no-thinning", action="store_true",
+                     help="keep every label=0 pixel instead of the exponential distance decay draw")
+    p_p.add_argument("--cluster-file", default=None,
+                     help="block_distance_profiles.py cluster assignment parquet, same file used "
+                          "for `folds`; pass with --cluster to restrict the block universe")
+    p_p.add_argument("--cluster", type=int, default=None,
+                     help="cluster id to restrict to, must match what `folds` was built with")
     p_p.set_defaults(func=cmd_pool)
 
     p_r = sub.add_parser("report")

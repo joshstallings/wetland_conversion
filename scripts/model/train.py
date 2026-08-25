@@ -14,8 +14,14 @@ model_analysis.ipynb only ever loads from disk.
       real base rate, not the oversampled one. Writes, per fold,
       model_fold{k}.joblib and one row of oof_predictions.parquet (label,
       raw score, calibrated score, distance to development), plus
-      fold_summary.csv, roc_by_fold.png, pr_by_fold.png, and config.json
-      across all folds.
+      fold_summary.csv, roc_by_fold.png, pr_by_fold.png (train and held out
+      fold PR-AUC side by side, so overfit is visible directly on the plot
+      rather than only as a gap in fold_summary's two columns), and
+      config.json across all folds. For model_type "slm" an extra fold (the same one
+      iter_folds uses for calibration, fold_id + 1) is held out of that
+      fold's training pool as a validation set for the loss curve, so an slm
+      baseline trains on k-2 folds where a lightgbm one trains on k-1; it
+      also writes loss_curve_fold{k}.png and loss_logs/fold{k}/metrics.csv.
 
   grid-search
       Screens an experiment's grid (scripts/model/experiments.py) against a single
@@ -113,6 +119,54 @@ def _binary_metrics(y_test: np.ndarray, proba: np.ndarray, pos_weight_mult: floa
     return metrics, curves
 
 
+def _save_threshold_curve(baseline_dir: str, oof: pd.DataFrame) -> None:
+    """Precision and recall against the calibrated probability cutoff, pooled
+    across every fold's out of fold predictions rather than split per fold
+    like roc_by_fold/pr_by_fold: picking one operating threshold is a
+    statewide (or, for a cluster restricted dataset, cluster wide) decision,
+    not a per fold one. Calibrated units on the x-axis, same as
+    fold_summary's best_threshold column, so a cutoff read off this plot
+    means the same thing there.
+    """
+    y_true = oof["label"].to_numpy()
+    p = oof["p_calibrated"].to_numpy()
+    precision, recall, thresholds = precision_recall_curve(y_true, p)
+    best_threshold, best_p, best_r, _ = model_common.best_f1_operating_point(precision, recall, thresholds)
+    # precision_recall_curve appends one extra (precision=1, recall=0) pair
+    # with no threshold behind it, same trim best_f1_operating_point does.
+    precision, recall = precision[:-1], recall[:-1]
+
+    # a handful of very negative logits can underflow to exactly 0.0 in
+    # float32, which a log-x axis can't place; drop those rather than let
+    # the axis blow up over a handful of pixels
+    keep = thresholds > 0
+    thresholds, precision, recall = thresholds[keep], precision[keep], recall[keep]
+
+    with plt.rc_context(model_common.SLIDE_RC):
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(thresholds, precision, color="#0072B2", lw=2.2, label="Precision")
+        ax.plot(thresholds, recall, color="#D55E00", lw=2.2, label="Recall")
+        ax.axvline(best_threshold, color="#666666", lw=1.2, ls="--", zorder=0)
+        # the gap between the two curves is widest a couple decades left of
+        # the crossing point (precision still low, recall not yet dropped),
+        # so the label lands there rather than on top of either line
+        # regardless of where the crossing point itself falls
+        label_idx = min(np.searchsorted(thresholds, best_threshold * 0.03), len(thresholds) - 1)
+        ax.text(thresholds[label_idx], 0.55,
+                f"best F1 threshold\n{best_threshold:.4f}\n(precision {best_p:.3f}, recall {best_r:.3f})",
+                va="center", fontsize=10)
+        ax.set_xscale("log")
+        ax.set_xlabel("Calibrated probability threshold (log scale)")
+        ax.set_ylabel("Precision / Recall")
+        ax.set_ylim(0, 1.02)
+        ax.set_title("Precision and recall by threshold, out of fold")
+        ax.legend(loc="best", frameon=False)
+        ax.grid(axis="y", alpha=0.25, lw=0.6)
+        ax.set_axisbelow(True)
+        fig.savefig(os.path.join(baseline_dir, "precision_recall_vs_threshold.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+
 def cmd_baseline(args):
     cfg = experiments.get(args.experiment)
     baseline_dir = os.path.join(cfg.results_dir, "baseline")
@@ -131,7 +185,7 @@ def cmd_baseline(args):
     model_factory = lambda: make_model(cfg)  # noqa: E731, reused per fold by iter_folds' calibrator
 
     fold_metrics = []
-    roc_curves, pr_curves = {}, {}
+    roc_curves, pr_curves, train_pr_curves = {}, {}, {}
     oof_frames = []
 
     for fold_id, X_train, y_train, w_train, _predict_test, make_calibrator in model_common.iter_folds(
@@ -139,18 +193,55 @@ def cmd_baseline(args):
     ):
         model = make_model(cfg)
 
-        # This necessary because slm uses a stratified batch sampler that 
-        # will ensure a certain number of positives are in a batch. 
+        # This necessary because slm uses a stratified batch sampler that
+        # will ensure a certain number of positives are in a batch.
         # If we didn't pass the natural weights, then, there would be 'double counting' as the model sees the
-        # boosted weights + the positives multiple times. 
+        # boosted weights + the positives multiple times.
         fit_weight = (
                 model_common.natural_weights(X_train, pos_weight_mult, pos_row_dup)
                 if cfg.model_type == "slm" else w_train
         )
-        model.fit(X_train[cfg.feature_cols], y_train, sample_weight=fit_weight)
 
-        # Save the model to disk. 
+        if cfg.model_type == "slm":
+            # carve one more fold out as a dedicated validation set for the loss curve, same
+            # fold iter_folds already uses as calib_fold for the nested isotonic split, so the
+            # main model and the calibrator's inner model end up trained on the same folds.
+            # A random row split of the pooled training frame would leak across block
+            # boundaries, and reusing this iteration's held out test fold would mean scoring
+            # the test fold during training, so neither is used here.
+            val_fold_id = (fold_id + 1) % k_folds
+            fit_mask = (X_train["fold"] != val_fold_id).to_numpy()
+            X_train_fit = X_train[fit_mask]
+            y_train_fit = y_train[fit_mask]
+            fit_weight_fit = fit_weight[fit_mask]
+
+            log_mean, log_std = model_common.fit_dist_normalizer(con, fold_id)
+            val_frame = model_common.natural_fold_sample(con, val_fold_id, 200_000, log_mean, log_std)
+            eval_X = val_frame[cfg.feature_cols]
+            eval_y = val_frame[model_common.TARGET_COL]
+
+            model.fit(
+                X_train_fit[cfg.feature_cols], y_train_fit, sample_weight=fit_weight_fit,
+                eval_X=eval_X, eval_y=eval_y, run_dir=baseline_dir, run_name=f"fold{fold_id}",
+                title=f"Train and validation loss, fold {fold_id}",
+            )
+            X_fit_frame, y_fit_frame = X_train_fit, y_train_fit
+        else:
+            model.fit(X_train[cfg.feature_cols], y_train, sample_weight=fit_weight)
+            X_fit_frame, y_fit_frame = X_train, y_train
+
+        # Save the model to disk.
         joblib.dump(model, os.path.join(baseline_dir, f"model_fold{fold_id}.joblib"))
+
+        # PR curve on the exact frame the model was fit on (weighted/duplicated
+        # pool for lightgbm, the val-fold-held-out slice of it for slm), so the
+        # train/val gap in pr_by_fold.png is a real overfit signal, not an
+        # artifact of scoring two different feature sets or fold splits.
+        proba_train = model.predict_proba(X_fit_frame[cfg.feature_cols])[:, 1]
+        train_precision, train_recall, _ = precision_recall_curve(y_fit_frame, proba_train)
+        train_pr_auc = auc(train_recall, train_precision)
+        train_avg_prec = average_precision_score(y_fit_frame, proba_train)
+        del proba_train
 
         # one streamed pass over the held out fold covers both the metrics
         # below and the decile analysis model_analysis.ipynb does later, so
@@ -167,6 +258,7 @@ def cmd_baseline(args):
         actual_acres = float(y_test.sum() * model_common.PIXEL_ACRES)
         fold_metrics.append({
             "fold": fold_id, **metrics,
+            "train_avg_precision": train_avg_prec, "train_pr_auc": train_pr_auc,
             "prevalence": float(y_test.mean()),
             "brier": float(np.mean((p_cal - y_test) ** 2)),
             "pred_acres": pred_acres, "actual_acres": actual_acres,
@@ -175,6 +267,7 @@ def cmd_baseline(args):
         })
         roc_curves[fold_id] = (curves["fpr"], curves["tpr"])
         pr_curves[fold_id] = (curves["recall_curve"], curves["precision_curve"])
+        train_pr_curves[fold_id] = (train_recall, train_precision)
         oof_frames.append(pd.DataFrame({
             "fold": np.full(len(y_test), fold_id, dtype=np.int8),
             "label": y_test.astype(np.int8),
@@ -183,12 +276,14 @@ def cmd_baseline(args):
             "p_calibrated": p_cal.astype(np.float32),
         }))
 
-        print(f"fold {fold_id}: AP={metrics['avg_precision']:.4f}  PR-AUC={metrics['pr_auc']:.4f}  "
+        print(f"fold {fold_id}: train AP={train_avg_prec:.4f} PR-AUC={train_pr_auc:.4f}  |  "
+              f"val AP={metrics['avg_precision']:.4f} PR-AUC={metrics['pr_auc']:.4f}  "
               f"ROC-AUC={metrics['roc_auc']:.4f}  acres {pred_acres:,.0f} predicted vs "
               f"{actual_acres:,.0f} actual ({100 * (pred_acres / actual_acres - 1):+.1f}%)")
         del model, X_train, y_train, w_train, y_test, proba, dist, p_cal, p_iso
 
-    fold_summary = pd.DataFrame(fold_metrics).set_index("fold")[model_common.SUMMARY_COLS + model_common.CALIB_COLS]
+    fold_summary = pd.DataFrame(fold_metrics).set_index("fold")[
+        ["train_avg_precision", "train_pr_auc"] + model_common.SUMMARY_COLS + model_common.CALIB_COLS]
     fold_summary = pd.concat([fold_summary, fold_summary.agg(["mean", "std"])])
     fold_summary.to_csv(os.path.join(baseline_dir, "fold_summary.csv"))
     print(fold_summary.to_string(float_format=lambda v: f"{v:,.4f}"))
@@ -199,23 +294,36 @@ def cmd_baseline(args):
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="no skill")
     ax.set_xlabel("False positive rate")
     ax.set_ylabel("True positive rate")
-    ax.set_title(f"ROC by fold: {args.experiment}")
+    ax.set_title("ROC by fold")
     ax.legend(loc="lower right")
     fig.savefig(os.path.join(baseline_dir, "roc_by_fold.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    for fold_id, (recall, precision) in pr_curves.items():
-        ax.plot(recall, precision, label=f"fold {fold_id} (AP {fold_summary.loc[fold_id, 'avg_precision']:.3f})")
-    ax.set_xlabel("Recall")
-    ax.set_ylabel("Precision")
-    ax.set_title(f"Precision and recall by fold: {args.experiment}")
-    ax.legend(loc="upper right")
-    fig.savefig(os.path.join(baseline_dir, "pr_by_fold.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    # train and held out side by side, same color per fold across both panels,
+    # so a fold that's overfit shows up as a visibly bigger gap between its
+    # two curves rather than only as two separate numbers in fold_summary
+    with plt.rc_context(model_common.SLIDE_RC):
+        fig, (ax_train, ax_val) = plt.subplots(1, 2, figsize=(12, 6), sharey=True)
+        for fold_id, (recall, precision) in train_pr_curves.items():
+            ax_train.plot(recall, precision, color=model_common.FOLD_COLORS[fold_id],
+                          label=f"fold {fold_id} (AP {fold_summary.loc[fold_id, 'train_avg_precision']:.3f})")
+        ax_train.set_xlabel("Recall")
+        ax_train.set_ylabel("Precision")
+        ax_train.set_title("Training fold")
+        ax_train.legend(loc="upper right", fontsize="small")
 
-    pd.concat(oof_frames, ignore_index=True).to_parquet(
-        os.path.join(baseline_dir, "oof_predictions.parquet"), index=False)
+        for fold_id, (recall, precision) in pr_curves.items():
+            ax_val.plot(recall, precision, color=model_common.FOLD_COLORS[fold_id],
+                        label=f"fold {fold_id} (AP {fold_summary.loc[fold_id, 'avg_precision']:.3f})")
+        ax_val.set_xlabel("Recall")
+        ax_val.set_title("Held out fold")
+        ax_val.legend(loc="upper right", fontsize="small")
+        fig.savefig(os.path.join(baseline_dir, "pr_by_fold.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    oof = pd.concat(oof_frames, ignore_index=True)
+    oof.to_parquet(os.path.join(baseline_dir, "oof_predictions.parquet"), index=False)
+    _save_threshold_curve(baseline_dir, oof)
 
     with open(os.path.join(baseline_dir, "config.json"), "w") as f:
         json.dump({**asdict(cfg), "k_folds": k_folds}, f, indent=2, sort_keys=True)
@@ -229,7 +337,7 @@ def _save_run_plots(run_dir: str, run_id: int, screen_fold: int, curves: dict,
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="no skill")
     ax.set_xlabel("False positive rate")
     ax.set_ylabel("True positive rate")
-    ax.set_title(f"ROC, run {run_id:03d}, fold {screen_fold}{title_suffix}")
+    ax.set_title(f"ROC, fold {screen_fold}{title_suffix}")
     ax.legend(loc="lower right")
     fig.savefig(os.path.join(run_dir, "roc.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -238,7 +346,7 @@ def _save_run_plots(run_dir: str, run_id: int, screen_fold: int, curves: dict,
     ax.plot(curves["recall_curve"], curves["precision_curve"], label=f"run {run_id:03d} (AP {avg_prec:.3f})")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.set_title(f"Precision and recall, run {run_id:03d}, fold {screen_fold}{title_suffix}")
+    ax.set_title(f"Precision and recall, fold {screen_fold}{title_suffix}")
     ax.legend(loc="upper right")
     fig.savefig(os.path.join(run_dir, "pr.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -472,7 +580,7 @@ def cmd_grid_finalize(args):
     ax.plot(recall_curve, precision_curve, color="#0072B2", label=f"AP {avg_prec:.3f}, PR-AUC {pr_auc:.3f}")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.set_title(f"Precision and recall on training data: {args.experiment} {run_id}")
+    ax.set_title("Precision and recall on training data")
     ax.legend(loc="upper right")
     pr_plot_path = os.path.join(analysis_dir, "train_pr_curve.png")
     fig.savefig(pr_plot_path, dpi=150, bbox_inches="tight")
@@ -521,7 +629,7 @@ def cmd_grid_finalize(args):
                 label=f"fold {fold_id} ({role_by_fold[fold_id]}, AP {avg_prec_fold:.3f})")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.set_title(f"Precision and recall by fold, natural data: {args.experiment} {run_id}")
+    ax.set_title("Precision and recall by fold, natural data")
     ax.legend(loc="upper right", fontsize="small")
     fold_pr_path = os.path.join(analysis_dir, "fold_pr_curve.png")
     fig.savefig(fold_pr_path, dpi=150, bbox_inches="tight")

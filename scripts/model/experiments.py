@@ -70,15 +70,6 @@ class ExperimentConfig:
 
 
 EXPERIMENTS = {
-    "distance-only": ExperimentConfig(
-        experiment_name="distance-only",
-        dataset_name="baseline-v1",
-        feature_cols=DIST_ONLY_FEATURE_COLS,
-        # feature_fraction is structurally inert with a single feature, kept
-        # anyway so this experiment's grid results line up column for column
-        # against full-features
-        grid=_STANDARD_GRID,
-    ),
     "Experiment5-BaselineV2-Neighborhood": ExperimentConfig(
         # Experiment4-BaselineV2 plus the six neighborhood columns, against
         # neighborhood-v2: same derived pos_weight_mult (~356) as baseline-v2,
@@ -88,21 +79,31 @@ EXPERIMENTS = {
         feature_cols=EXTENDED_FEATURE_COLS,
         grid=_IMBALANCE_GRID,
     ),
-    "Experiment5b-BaselineV2-NoNeighborhood": ExperimentConfig(
+    "Experiment5b-BaselineV2": ExperimentConfig(
         # the Experiment5 counterpart without the six neighborhood columns,
         # same relationship 3b has to 3: same dataset (baseline-v2, so same
         # derived pos_weight_mult) and feature set as Experiment4-BaselineV2,
         # but screened against _IMBALANCE_GRID instead of left at defaults,
         # so it's a fair grid-search comparison against Experiment5
-        experiment_name="Experiment5b-BaselineV2-NoNeighborhood",
+        experiment_name="Experiment5b-BaselineV2",
         dataset_name="baseline-v2",
         feature_cols=FEATURE_COLS,
-        grid=_IMBALANCE_GRID,
+        grid=None,
     ),
     "Experiment6-SLMInitialEvaluation": ExperimentConfig(
         # Running a simple linear model on Baseline-v2 with the AE embeddings and distance features.
         experiment_name="Experiment6-SLMInitialEvaluation",
         dataset_name="baseline-v2",
+        feature_cols=FEATURE_COLS,
+        model_type="slm",
+        grid=None
+    ),
+    "Experiment7-SLMCluster0": ExperimentConfig(
+        # Same SLM and feature set as Experiment6, but trained against
+        # cluster0-v1, the near-development block_distance_profiles regime
+        # only, built with --no-thinning so every natural pixel is kept.
+        experiment_name="Experiment7-SLMCluster0",
+        dataset_name="cluster0-v1",
         feature_cols=FEATURE_COLS,
         model_type="slm",
         grid=None

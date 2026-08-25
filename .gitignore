@@ -2,5 +2,7 @@ data/*
 .claude/
 CLAUDE.md
 **/__pycache__
-results/models
+results/
+lightning_logs/
 .DS_Store
+.vscode/
