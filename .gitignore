@@ -6,3 +6,4 @@ results/
 lightning_logs/
 .DS_Store
 .vscode/
+old/
