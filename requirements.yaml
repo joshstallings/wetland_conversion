@@ -392,6 +392,7 @@ dependencies:
   - python-tzdata=2026.3
   - python_abi=3.11
   - pytorch=2.13.0
+  - pytorch-lightning=2.6.5
   - pyu2f=0.1.5
   - pyyaml=6.0.3
   - pyzmq=27.1.0
@@ -445,6 +446,7 @@ dependencies:
   - toml=0.10.2
   - tomli=2.4.1
   - toolz=1.1.0
+  - torchmetrics=1.9.0
   - torchvision=0.28.0
   - tornado=6.5.8
   - tqdm=4.70.0

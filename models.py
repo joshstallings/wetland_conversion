@@ -10,9 +10,15 @@ import pytorch_lightning as pl
 from torchmetrics.classification import BinaryPrecision, BinaryRecall, BinaryF1Score
 
 
-
 class SimpleLinearModel(pl.LightningModule):
-    def __init__(self, n_features, lr=1e-3, threshold=0.5):
+    def __init__(self, n_features, lr=1e-3, threshold=0.5, pos_weight=None):
+        """
+        pos_weight: scalar weight on the positive class in BCEWithLogitsLoss.
+            Needed here because training sees every row with no undersampling
+            so positives are ~356:1 outnumbered. Defaults to None (unweighted). 
+            Compute it from the true population counts (population_stats.load_population_stats),
+            not a fold's counts. 
+        """
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
@@ -20,7 +26,8 @@ class SimpleLinearModel(pl.LightningModule):
         self.model = nn.Sequential(
             nn.Linear(n_features, 1)
         )
-        self.loss_fn = nn.BCEWithLogitsLoss()
+        loss_pos_weight = torch.tensor(pos_weight) if pos_weight is not None else None
+        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=loss_pos_weight)
 
         self.train_precision = BinaryPrecision(threshold=threshold)
         self.train_recall = BinaryRecall(threshold=threshold)

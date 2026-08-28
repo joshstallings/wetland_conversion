@@ -4,12 +4,7 @@
 
 Implementation recipe for training on every row, no undersampling, using a
 shuffle-buffer stream and a class-weighted loss instead of a stratified
-sampler. This is one of two parallel training approaches for this project;
-the other, a cached negative-undersampled pool, is in
-`data_pipeline_recipe_path_a.md`. The two are meant to be run against the
-same seeded fold splits and compared on the same natural-rate validation
-stream, so keep the fold-assignment step (step 2) identical between the two
-files if you touch it.
+sampler.
 
 Target machine has 16GB RAM and 726GB free disk. Source data is 59.27M rows,
 193 features, 1727 spatial blocks (~10km each), true positive rate 0.28%
@@ -38,14 +33,11 @@ This is what keeps precision/recall/AUPRC honest, since scoring against a
 downsampled validation set inflates precision relative to what the model
 will see in production.
 
-Path B applies that same principle to training: nothing is cached or
-downsampled, every row from the source parquet is used. This avoids the
-question path A has to answer (whether discarding most negatives costs
-anything), at the cost of more wall clock per epoch, since every epoch
-re-reads and decompresses parquet rather than reusing an in-RAM/memmapped
-array, and a shuffle buffer standing in for a true full-epoch permutation.
-Whether that cost is worth paying is an empirical question, answered by
-comparing this path's results against path A's on the same splits.
+This recipe applies that same principle to training too: nothing is cached
+or downsampled, every row from the source parquet is used, at the cost of
+more wall clock per epoch, since every epoch re-reads and decompresses
+parquet rather than reusing an in-RAM/memmapped array, and a shuffle buffer
+standing in for a true full-epoch permutation.
 
 ## File layout
 
@@ -54,21 +46,17 @@ data/
   population_stats.json   # true class counts, built once (see step 1)
 results/
   path_b/
-    seed_{seed}/
-      fold_{k}/
-        metrics.csv, val_preds.npz, loss_curve.png, confusion_matrix.png, pr_curve.png
-      manifest.json     # seed, per-fold block/row/positive counts
-    seed_summary.csv     # one row per (seed, fold), for the variance check
+    fold_{k}/
+      metrics.csv, val_preds.npz, loss_curve.png, confusion_matrix.png, pr_curve.png
+    manifest.json      # seed, per-fold block/row/positive counts
+    fold_summary.csv   # one row per fold: precision, recall, F1, AUPRC
 ```
-
-No `data/train_pool_cache/` here — that's path A's, and path B has nothing
-equivalent by design.
 
 ## Step 1: compute true population class counts (one-time, cheap)
 
-Path B's loss weighting needs the true positive/negative counts, and unlike
-path A there's no cache-building pass that already touches every row to get
-them from. This is a narrow scan, not a data cache: read only `label` and
+This recipe's loss weighting needs the true positive/negative counts, and
+there's no cache-building pass elsewhere that already touches every row to
+get them from. This is a narrow scan, not a data cache: read only `label` and
 `block_id` columns from the full source dataset (`dataset.to_table(columns=["label", "block_id"])`), which is fast (a couple hundred milliseconds at this
 dataset's size, since it skips the 192 embedding columns entirely).
 
@@ -113,10 +101,6 @@ total row count, positive count, positive rate. That log is your check for
 whether a given seed happened to produce a degenerate split (e.g., a fold
 that got unlucky and has almost no positives) before you spend time
 training on it.
-
-Keep this function identical to the same-named one in path A's recipe. If
-you want a given seed to produce the same split under both paths for a
-direct comparison, this is the piece that has to match exactly.
 
 ## Step 3: `StreamingTrainDataset` (`IterableDataset`, streams from source parquet, discards nothing)
 
@@ -177,15 +161,14 @@ Known cost, not a memory risk: both this and step 3 rescan the relevant
 slice of the source parquet every epoch (step 3) or every fold (step 4).
 With predicate pushdown on `block_id` this skips most row groups outside
 the matching blocks, but running many epochs and many seeds will add up in
-wall clock — this is path B's main tradeoff against path A, not something
-to try to eliminate here.
+wall clock — a known cost of this design, not something to try to
+eliminate here.
 
 ## Step 5: model change — weighted loss instead of a stratified sampler
 
 `SimpleLinearModel.__init__` needs a `pos_weight` argument, defaulting to
-`None` (unweighted) so path A's model construction doesn't change, passed
-through to `nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))` when
-set.
+`None` (unweighted), passed through to
+`nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))` when set.
 
 Compute `pos_weight` from step 1's true full-population class counts, not
 the fold's: `pos_weight = true_negatives / true_positives ≈ 59,101,423 /
@@ -197,9 +180,9 @@ means single positive examples can dominate a batch's gradient, worth
 watching for loss spikes early in training and reducing the learning rate
 if so.
 
-## Step 6: `SpatialCVDataModule` for path B
+## Step 6: `SpatialCVDataModule`
 
-Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, source_parquet_path, batch_size, buffer_size=300_000)`. No `pos_frac` here, that's path A's parameter for `StratifiedBatchSampler`; `pos_weight` lives on the model (step 5), not the DataModule.
+Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, source_parquet_path, batch_size, buffer_size=300_000)`. No `pos_frac` here (that parameter belongs to a stratified batch sampler this recipe doesn't use); `pos_weight` lives on the model (step 5), not the DataModule.
 
 - `setup()`: call `assign_folds` from step 2 with the given seed, split into
   this fold's train/val block_ids, build the `StreamingTrainDataset`
@@ -209,31 +192,22 @@ Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, source_parquet
 - `train_dataloader()`: plain `DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=0)`. No sampler — `IterableDataset` doesn't support one. Leave `num_workers=0`: `IterableDataset` isn't safe under multiple workers without sharding the block list yourself via `torch.utils.data.get_worker_info()`, which isn't worth the complexity until you've actually measured an IO stall that raising workers would fix.
 - `val_dataloader()`: `DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=0)`. No `shuffle`, no `persistent_workers`.
 
-## Step 7: update `train.py`'s `main()` to loop over seeds
+## Step 7: `train.py`'s `main()`
 
-- Add a `SEEDS` list (e.g. `[0, 1, 2, 3, 4]`, five repeats is a reasonable
-  start for eyeballing spread without a huge time cost) — use the same
-  list you use for path A if you're planning to compare the two.
-- Nest the existing fold loop inside a seed loop: for each seed, run all
-  `n_splits` folds, writing to `results/path_b/seed_{seed}/fold_{k}/`.
-  Write `results/path_b/seed_{seed}/manifest.json` with the seed and the
-  per-fold block/row/positive counts from step 2's logging.
+- Fix a single `SEED` for the run (the design decision section above covers
+  why fold assignment is a runtime draw rather than a saved file — pick one
+  and log it).
+- Loop over `n_splits` folds for that seed, writing to
+  `results/path_b/fold_{k}/`. Write `results/path_b/manifest.json` with the
+  seed and the per-fold block/row/positive counts from step 2's logging.
 - Epoch budget: each epoch here re-reads and decompresses this fold's slice
-  of the source parquet, so path B epochs cost meaningfully more wall clock
-  than path A's. Default to fewer epochs than path A's 15 (start at 2-3)
-  and log the epoch count actually run in the manifest, so a later
-  comparison against path A accounts for the difference rather than
-  assuming both got an equal budget.
-- After all seeds finish, build `results/path_b/seed_summary.csv`: one row
-  per (seed, fold) with precision, recall, F1, AUPRC, that fold's true
-  positive rate, and epochs run. Report mean and standard deviation of each
-  metric grouped by seed (spread across folds within a seed) and grouped by
-  fold index across seeds (spread across which blocks happened to land
-  where) — that second grouping is the actual answer to "is performance
-  even across random block assignments." If fold-index-grouped spread is
-  small relative to seed-to-seed spread, performance is stable; if it's the
-  other way, some particular block composition is driving results and
-  that's worth digging into before trusting any single run's number.
+  of the source parquet, so epochs cost meaningfully more wall clock than a
+  cached in-RAM dataset would. Start low (2-3) and log the epoch count
+  actually run in the manifest.
+- After all folds finish, build `results/path_b/fold_summary.csv`: one row
+  per fold with precision, recall, F1, AUPRC, that fold's true positive
+  rate, and epochs run, plus the mean and standard deviation of each metric
+  across folds.
 
 ## Step 8: before trusting any number out of this pipeline
 
@@ -241,11 +215,10 @@ Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, source_parquet
   negatives. If not, something is off in the population scan (check the
   label binarization first) before any model gets near the data.
 - Per-fold positive rate (step 2 log) should hover near 0.28% for every
-  fold, every seed. A fold that's off by a large margin is a sign the
-  greedy balancer isn't working as intended, or that a few outsized blocks
-  (the 111,527-row block, for instance) are dominating one fold.
-- If loss isn't decreasing, or decreases much slower than path A's, check
-  `buffer_size` first — too small a buffer relative to how spatially
+  fold. A fold that's off by a large margin is a sign the greedy balancer
+  isn't working as intended, or that a few outsized blocks (the
+  111,527-row block, for instance) are dominating one fold.
+- If loss isn't decreasing, check `buffer_size` first — too small a buffer relative to how spatially
   ordered the source parquet is means batches are still spatially
   clustered, which both hurts optimization and reintroduces the
   autocorrelation leakage concern this project already watches for.
@@ -254,10 +227,3 @@ Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, source_parquet
   on this project: check normalization stats were computed from train rows
   only, and check `pos_weight` is actually reaching the loss (not silently
   `None`).
-- If you've also run path A (`data_pipeline_recipe_path_a.md`) against the
-  same seeds, compare `results/path_b/seed_summary.csv` against
-  `results/path_a/seed_summary.csv` on matching (seed, fold) rows, on
-  AUPRC specifically. If the two land far apart, that gap is informative
-  and worth understanding before picking one — a likely culprit if B looks
-  surprisingly worse is too few epochs for the shuffle-buffer stream to
-  converge relative to path A's budget.
