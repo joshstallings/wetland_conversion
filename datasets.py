@@ -31,8 +31,9 @@ def _read_feature_matrix(batch, feature_cols):
 def _block_id_filter(block_ids):
     """pyarrow.dataset filter expression selecting rows whose block_id is in
     block_ids. Shared by the normalization pass and both streaming datasets so
-    the predicate pushdown behavior is identical everywhere it's used."""
-    return pc.field("block_id").isin(pa.array(np.asarray(block_ids, dtype=np.int64)))
+    the predicate pushdown behavior is identical everywhere it's used.
+    block_id is a string in the source parquet (e.g. "b0239_0323"), not an int."""
+    return pc.field("block_id").isin(pa.array(list(block_ids), type=pa.large_string()))
 
 
 def _to_tensors(x_row, y_row):
@@ -112,7 +113,17 @@ class StreamingTrainDataset(IterableDataset):
     trick tf.data's shuffle() and WebDataset use) instead of holding the whole
     fold in memory. Rows arrive from parquet roughly in spatial (tile) order, so
     buffer_size has to span more than one source file or batches stay spatially
-    clustered. 
+    clustered.
+
+    The swap is done a batch at a time (one rng.choice() draw and one gather/
+    scatter over the whole batch) instead of one draw and one buffer[slot] per
+    row -- profiling a live training run showed the old per-row Python loop, not
+    the parquet read itself, was the dominant cost of __iter__. Slots are drawn
+    without replacement within a batch so every incoming row still gets a slot
+    and every evicted row is yielded exactly once, same as the row-by-row
+    version -- sampling with replacement would let two draws in one batch pick
+    the same slot, which silently drops one of the new rows and duplicates the
+    evicted one.
     """
 
     def __init__(self, source_parquet_path, feature_cols, label_col, train_block_ids,
@@ -131,30 +142,49 @@ class StreamingTrainDataset(IterableDataset):
         columns = self.feature_cols + [self.label_col, "block_id"]
 
         rng = np.random.default_rng()
-        buffer = []
+        buffer_x = np.empty((self.buffer_size, len(self.feature_cols)), dtype=np.float32)
+        buffer_y = np.empty(self.buffer_size, dtype=np.float32)
+        filled = 0  # how many buffer slots hold real rows, until the buffer's topped up
 
-        # loop through the dataset in batches, only looking at training blocks
         for batch in dataset.to_batches(columns=columns, filter=filt):
             x = (_read_feature_matrix(batch, self.feature_cols) - self.mean) / self.std
             raw_label = batch.column(self.label_col).to_numpy(zero_copy_only=False)
             y = binarize_label(raw_label)
 
-            # then for every row, append to buffer if buffer size not yet reached. 
-            for i in range(len(y)):
-                row = (x[i], y[i])
-                if len(buffer) < self.buffer_size:
-                    buffer.append(row)
-                else:
-                    # if the buffer size is reached in this batch, start randomly
-                    # pulling from the buffer
-                    slot = int(rng.integers(0, self.buffer_size))
-                    yield _to_tensors(*buffer[slot])
-                    buffer[slot] = row
-        # otherwise the entire batch fit into the buffer,
-        # so shuffle it and start yielding values. 
-        rng.shuffle(buffer)
-        for row in buffer:
-            yield _to_tensors(*row)
+            # top up the buffer directly from this batch before any swapping starts
+            if filled < self.buffer_size:
+                n_fill = min(len(x), self.buffer_size - filled)
+                buffer_x[filled:filled + n_fill] = x[:n_fill]
+                buffer_y[filled:filled + n_fill] = y[:n_fill]
+                filled += n_fill
+                x, y = x[n_fill:], y[n_fill:]
+
+            # buffer's full: swap the rest of this batch in chunks no bigger than
+            # buffer_size (chunking only ever triggers if a single parquet batch
+            # somehow outgrows the buffer, buffer_size defaults to 300_000)
+            for start in range(0, len(x), self.buffer_size):
+                x_chunk = x[start:start + self.buffer_size]
+                y_chunk = y[start:start + self.buffer_size]
+
+                # sample slots *without* replacement -- with replacement, a slot
+                # drawn twice in the same chunk would evict the same old row
+                # twice (a duplicate in the output stream) and silently drop
+                # whichever new row didn't get scattered last, instead of every
+                # input row appearing exactly once in the output
+                slots = rng.choice(self.buffer_size, size=len(x_chunk), replace=False)
+                evicted_x = buffer_x[slots]
+                evicted_y = buffer_y[slots]
+                buffer_x[slots] = x_chunk
+                buffer_y[slots] = y_chunk
+
+                for i in range(len(slots)):
+                    yield _to_tensors(evicted_x[i], evicted_y[i])
+
+        # stream ended before the buffer filled (small fold, or buffer_size set
+        # too large) -- only shuffle and drain the slots that actually got written
+        order = rng.permutation(filled)
+        for i in order:
+            yield _to_tensors(buffer_x[i], buffer_y[i])
 
 
 class StreamingValDataset(IterableDataset):
@@ -190,7 +220,7 @@ class StreamingValDataset(IterableDataset):
                 yield _to_tensors(x[i], y[i])
 
 
-class SpatialCVDataModule(pl.LightningDataModule):
+class StreamingDataModule(pl.LightningDataModule):
     """
     Train and val both stream from the source parquet, train through a shuffle
     buffer (StreamingTrainDataset), val at the natural rate
@@ -224,7 +254,7 @@ class SpatialCVDataModule(pl.LightningDataModule):
         self.fold_assignment = assign_folds(
             population_stats["block_row_counts"], self.n_splits, self.seed
         )
-        all_blocks = np.array(list(self.fold_assignment.keys()), dtype=np.int64)
+        all_blocks = np.array(list(self.fold_assignment.keys()), dtype=object)
         fold_of_block = np.array(list(self.fold_assignment.values()), dtype=np.int64)
         self.val_block_ids = all_blocks[fold_of_block == self.fold_idx].tolist()
         self.train_block_ids = all_blocks[fold_of_block != self.fold_idx].tolist()

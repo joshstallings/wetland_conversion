@@ -26,14 +26,14 @@ EXPECTED_TOTAL_NEGATIVE = 59_101_423
 def compute_population_stats(source_parquet_path):
     """
     Returns a dict with total_rows, total_positive, total_negative, and
-    block_row_counts (dict block_id (int) -> row count, what folds.assign_folds
-    needs for its greedy balancer).
+    block_row_counts (dict block_id (str, e.g. "b0239_0323") -> row count,
+    what folds.assign_folds needs for its greedy balancer).
     """
     dataset = ds.dataset(source_parquet_path, format="parquet")
     table = dataset.to_table(columns=["label", "block_id"])
 
     raw_label = table.column("label").to_numpy(zero_copy_only=False)
-    block_id = table.column("block_id").to_numpy(zero_copy_only=False).astype(np.int64)
+    block_id = table.column("block_id").to_numpy(zero_copy_only=False)
 
     y = binarize_label(raw_label)
     total_rows = len(raw_label)
@@ -41,7 +41,7 @@ def compute_population_stats(source_parquet_path):
     total_negative = total_rows - total_positive
 
     unique_blocks, counts = np.unique(block_id, return_counts=True)
-    block_row_counts = {int(b): int(c) for b, c in zip(unique_blocks, counts)}
+    block_row_counts = {str(b): int(c) for b, c in zip(unique_blocks, counts)}
 
     return {
         "source_parquet_path": str(source_parquet_path),
@@ -54,24 +54,19 @@ def compute_population_stats(source_parquet_path):
 
 
 def save_population_stats(stats, out_path):
-    """JSON only allows string dict keys, so block_row_counts gets stringified
-    on write; load_population_stats casts it back to int on read."""
+    """block_id is already a string (JSON's only allowed dict key type), so
+    block_row_counts round trips through json.dump/load as is."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    serializable = dict(stats)
-    serializable["block_row_counts"] = {
-        str(b): c for b, c in stats["block_row_counts"].items()
-    }
     with open(out_path, "w") as f:
-        json.dump(serializable, f, indent=2)
+        json.dump(stats, f, indent=2)
 
 
 def load_population_stats(path=POPULATION_STATS_PATH):
-    """Loads population_stats.json, restoring block_row_counts keys to int."""
+    """Loads population_stats.json."""
     with open(path) as f:
         stats = json.load(f)
-    stats["block_row_counts"] = {int(k): int(v) for k, v in stats["block_row_counts"].items()}
     return stats
 
 

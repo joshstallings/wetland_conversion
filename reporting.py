@@ -24,14 +24,21 @@ from sklearn.metrics import (
 
 def get_val_predictions(model, val_dataloader):
     """Runs model over val_dataloader once, no grad. Returns (probs, labels) as
-    numpy arrays."""
+    numpy arrays.
+
+    Called after trainer.fit(), on a model loaded straight from checkpoint --
+    unlike inside fit()/validate(), there's no Trainer here to move batches onto
+    the model's device, so it has to be done by hand or this breaks the moment
+    the accelerator isn't cpu (mps here).
+    """
     model.eval()
+    device = next(model.parameters()).device
     all_probs, all_labels = [], []
     with torch.no_grad():
         for x, y in val_dataloader:
-            logits = model(x).squeeze(1)
+            logits = model(x.to(device)).squeeze(1)
             probs = torch.sigmoid(logits)
-            all_probs.append(probs)
+            all_probs.append(probs.cpu())
             all_labels.append(y)
     return torch.cat(all_probs).numpy(), torch.cat(all_labels).numpy()
 

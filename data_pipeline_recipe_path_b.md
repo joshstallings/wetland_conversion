@@ -45,7 +45,7 @@ standing in for a true full-epoch permutation.
 data/
   population_stats.json   # true class counts, built once (see step 1)
 results/
-  path_b/
+  streaming/
     fold_{k}/
       metrics.csv, val_preds.npz, loss_curve.png, confusion_matrix.png, pr_curve.png
     manifest.json      # seed, per-fold block/row/positive counts
@@ -77,23 +77,27 @@ need rebuilding unless the source dataset changes.
 Sanity check: total positives should read 165,908, total negatives
 59,101,423.
 
-## Step 2: seeded fold assignment (runtime, in `datasets.py` or a new `folds.py`)
+## Step 2: seeded fold assignment (runtime, in `folds.py`)
 
-Signature: `assign_folds(block_ids, n_splits, seed) -> dict[block_id -> fold_idx]`.
+Signature: `assign_folds(block_row_counts, n_splits, seed) -> dict[block_id -> fold_idx]`.
+`block_row_counts` is a `{block_id (str): row_count}` dict, built once by
+step 1 (`population_stats.json`'s `block_row_counts`) and passed straight
+in — this function doesn't re-derive counts from a raw block_id array
+itself. `block_id` is a string in the source parquet (e.g. `"b0239_0323"`),
+not an int.
 
 Do not use `sklearn.GroupKFold` for this — it takes no `random_state`, so
 "randomizing" it means relying on its undocumented sensitivity to input
 order, which is fragile and not really what you want to control. Write it
 directly instead:
 
-1. `rng = np.random.default_rng(seed)`, shuffle the unique block_id array.
+1. `rng = np.random.default_rng(seed)`, shuffle `block_row_counts`'s keys.
 2. Because block size is heavily skewed (min 1 row, max 111,527, mean
    ~34,318), a plain round-robin deal can leave one fold with a
    disproportionate share of rows or positives just by chance. Use greedy
    size balancing instead: for each shuffled block, assign it to whichever
    fold currently has the fewest total rows so far (track a running
-   row-count total per fold from the block's known row count, from step 1's
-   `population_stats.json`).
+   row-count total per fold from `block_row_counts`).
 3. Return the block_id -> fold_idx dict.
 
 At the start of every run, after calling this, log per fold: block count,
@@ -109,38 +113,54 @@ training on it.
   fold's train block_ids, per-feature normalization stats, and
   `buffer_size` (default ~300,000 rows — at 193 features x 4 bytes that's
   roughly 230MB, comfortable on 16GB RAM).
-- `__iter__` opens a `to_batches(columns=feature_cols + [label_col, "block_id"], filter=pc.field("block_id").isin(pa.array(train_block_ids)))`
-  reader over the source dataset. Binarize `label_col` as each row is read —
-  `label == 1` ("Converted to developed") is positive, `label == 0` or
-  `label == 2` is negative — before it ever reaches the shuffle buffer or
-  the loss; the raw 3-valued column is not a valid BCE target. Then run a
-  reservoir-style shuffle buffer: fill a buffer of `buffer_size` rows first;
-  once full, for each new incoming row, evict a uniformly random buffer
-  slot (yield the evicted row, normalized), insert the new row in its
-  place; at end of stream, drain the buffer in random order. This is the
-  same trick tf.data's
-  `shuffle()` and WebDataset use to approximate a full shuffle without
-  holding the whole dataset in memory. Rows arrive from parquet roughly in
-  spatial (tile) order, so check that `buffer_size` is large enough to span
-  more than one source file — otherwise batches stay spatially clustered
-  and you've reintroduced the autocorrelation problem this project already
-  watches for.
+- `__iter__` opens a `to_batches(columns=feature_cols + [label_col, "block_id"], filter=pc.field("block_id").isin(pa.array(train_block_ids, type=pa.large_string())))`
+  reader over the source dataset (`block_id` is a string column, so filter
+  against a string array, not an int one). Binarize `label_col` as each row
+  is read — `label == 1` ("Converted to developed") is positive, `label ==
+  0` or `label == 2` is negative — before it ever reaches the shuffle
+  buffer or the loss; the raw 3-valued column is not a valid BCE target.
+  Then run a reservoir-style shuffle buffer, swapped a batch at a time
+  rather than one row at a time (profiling showed a python-level per-row
+  loop, not the parquet read, was the dominant cost of `__iter__`): top the
+  buffer up to `buffer_size` directly from the first incoming batches, then
+  for each later batch draw that many buffer slots *without* replacement
+  (`rng.choice(buffer_size, size=len(batch), replace=False)`), yield the
+  evicted rows, scatter the new batch into those slots — sampling without
+  replacement matters here, since a slot drawn twice in one batch would
+  duplicate an evicted row and silently drop one of the new ones. If a
+  single parquet batch is larger than `buffer_size`, swap it in
+  `buffer_size`-sized chunks. At end of stream, permute and drain only the
+  slots that actually got filled (matters if the fold is smaller than
+  `buffer_size`). This is the same trick tf.data's `shuffle()` and
+  WebDataset use to approximate a full shuffle without holding the whole
+  dataset in memory. Rows arrive from parquet roughly in spatial (tile)
+  order, so check that `buffer_size` is large enough to span more than one
+  source file — otherwise batches stay spatially clustered and you've
+  reintroduced the autocorrelation problem this project already watches
+  for.
 - No `StratifiedBatchSampler` here — positive rebalancing happens in the
   loss (step 5's `pos_weight`), not the batch composition, so batches are
   plain shuffled draws and will average close to the true 0.28% positive
   rate; don't expect every batch to contain a positive.
 - Normalization stats: compute them once per fold with a single streaming
-  pass over just this fold's train blocks using a running mean/var
-  (Welford's algorithm), before training starts — there's no cached array
-  to compute a direct mean/std from here. `dist_to_developed_2019_m` is on
-  a meters scale while the AlphaEarth embedding dims are roughly
-  unit-scaled, so skipping this step leaves a linear model effectively only
-  looking at distance. Check for NaN/inf in `dist_to_developed_2019_m`
-  during this pass (coastal/boundary tiles are the likely source of an
-  occasional bad value) and exclude or impute those rows rather than
-  letting a single NaN poison the running stats. Reuse these same stats for
-  this fold's validation stream too (step 4) — always train-fold
-  statistics, never val's own.
+  pass over just this fold's train blocks using a running mean/var (a
+  batched, parallel-variance form of Welford's algorithm — updated a batch
+  at a time, not row at a time, same reasoning as the shuffle buffer
+  above), before training starts — there's no cached array to compute a
+  direct mean/std from here. Only normalize `features.COLS_TO_NORMALIZE`
+  (just `dist_to_developed_2019_m`, which is on a meters scale) rather than
+  every feature column — the AlphaEarth embedding dims come out of GEE
+  already roughly unit-scaled, so normalizing them too is just extra noise
+  on top of a scale that's already fine. Embed the result into a
+  full-length `(mean, std)` pair shaped `(len(feature_cols),)`, with mean 0
+  / std 1 (a no-op under `(x - mean) / std`) on every column not in
+  `COLS_TO_NORMALIZE`, so it lines up with the full feature matrix at
+  apply time. Check for NaN/inf in `dist_to_developed_2019_m` during this
+  pass (coastal/boundary tiles are the likely source of an occasional bad
+  value) and drop those rows from the running stats rather than letting a
+  single NaN poison them. Reuse these same stats for this fold's
+  validation stream too (step 4) — always train-fold statistics, never
+  val's own.
 
 ## Step 4: `StreamingValDataset` for validation (`IterableDataset`, streams from source parquet)
 
@@ -180,31 +200,55 @@ means single positive examples can dominate a batch's gradient, worth
 watching for loss spikes early in training and reducing the learning rate
 if so.
 
-## Step 6: `SpatialCVDataModule`
+## Step 6: `StreamingDataModule`
 
-Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, source_parquet_path, batch_size, buffer_size=300_000)`. No `pos_frac` here (that parameter belongs to a stratified batch sampler this recipe doesn't use); `pos_weight` lives on the model (step 5), not the DataModule.
+Named `StreamingDataModule`, not `SpatialCVDataModule` — path A's
+DataModule (`data_pipeline_recipe_path_a.md` step 5) needs a different
+constructor (`cache_dir`/`pos_frac` instead of `buffer_size`), so it can't
+share this class or this name. `train.py`'s unified entry point (step 7
+below) imports both under these distinct names.
 
-- `setup()`: call `assign_folds` from step 2 with the given seed, split into
-  this fold's train/val block_ids, build the `StreamingTrainDataset`
-  (step 3) for train (which also produces this fold's normalization
-  stats), build the `StreamingValDataset` (step 4) from the source parquet
-  for val, reusing those same normalization stats.
+Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, cols_to_normalize, source_parquet_path, population_stats_path="data/population_stats.json", batch_size, buffer_size=300_000)`. No `pos_frac` here (that parameter belongs to path A's stratified batch sampler); `pos_weight` lives on the model (step 5), not the DataModule. `cols_to_normalize` is `features.COLS_TO_NORMALIZE`, passed through to step 3's normalization pass.
+
+- `setup()`: load `population_stats.json`, call `assign_folds` from step 2
+  with the given seed and its `block_row_counts`, split into this fold's
+  train/val block_ids, compute this fold's normalization stats (step 3),
+  build the `StreamingTrainDataset` (step 3) for train, build the
+  `StreamingValDataset` (step 4) from the source parquet for val, reusing
+  those same normalization stats.
 - `train_dataloader()`: plain `DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=0)`. No sampler — `IterableDataset` doesn't support one. Leave `num_workers=0`: `IterableDataset` isn't safe under multiple workers without sharding the block list yourself via `torch.utils.data.get_worker_info()`, which isn't worth the complexity until you've actually measured an IO stall that raising workers would fix.
 - `val_dataloader()`: `DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=0)`. No `shuffle`, no `persistent_workers`.
 
 ## Step 7: `train.py`'s `main()`
 
+`train.py` is shared with path A (`data_pipeline_recipe_path_a.md`), not a
+separate script per path — the two pipelines differ only in which
+DataModule gets built and where results land. Everything else (the seeded
+fold, `models.SimpleLinearModel`, `reporting.py`'s plots and
+`write_fold_summary`) is common code both branches call into. A `PIPELINE`
+selector (`streaming` / `cached_pool` — a module constant or a
+`--pipeline` CLI flag) at the top of `main()` picks between them:
+
+- `streaming`: build `StreamingDataModule` (step 6) with `buffer_size`,
+  write results under `results/streaming/`.
+- `cached_pool`: build `CachedPoolDataModule` (path A step 5) with
+  `cache_dir`/`pos_frac`, write results under `results/cached_pool/`.
+
+The rest of this step describes the `streaming` branch specifically:
+
 - Fix a single `SEED` for the run (the design decision section above covers
   why fold assignment is a runtime draw rather than a saved file — pick one
-  and log it).
+  and log it; the same `SEED` under the `cached_pool` branch produces the
+  same fold split, which is what step 8's cross-path comparison relies on).
 - Loop over `n_splits` folds for that seed, writing to
-  `results/path_b/fold_{k}/`. Write `results/path_b/manifest.json` with the
-  seed and the per-fold block/row/positive counts from step 2's logging.
+  `results/streaming/fold_{k}/`. Write `results/streaming/manifest.json`
+  with the seed and the per-fold block/row/positive counts from step 2's
+  logging.
 - Epoch budget: each epoch here re-reads and decompresses this fold's slice
   of the source parquet, so epochs cost meaningfully more wall clock than a
   cached in-RAM dataset would. Start low (2-3) and log the epoch count
   actually run in the manifest.
-- After all folds finish, build `results/path_b/fold_summary.csv`: one row
+- After all folds finish, build `results/streaming/fold_summary.csv`: one row
   per fold with precision, recall, F1, AUPRC, that fold's true positive
   rate, and epochs run, plus the mean and standard deviation of each metric
   across folds.

@@ -1,7 +1,9 @@
 """
-This file will contain classes for architectures used in this project, 
-starting with a basic linear model. 
+This file will contain classes for architectures used in this project,
+starting with a basic linear model.
 """
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -79,4 +81,23 @@ class SimpleLinearModel(pl.LightningModule):
     def configure_optimizers(self):
         return Adam(self.parameters(), lr=self.lr)
 
-    
+
+def apply_intercept_correction(model, true_negative, true_positive, sample_negative, sample_positive):
+    """
+    King and Zeng (2001) closed-form intercept correction for rare-event
+    logistic regression trained on an artificially balanced sample -- path
+    A's negative-undersampled cache, per data_pipeline_recipe_path_a.md step
+    3. Shifts the final linear layer's bias in place by
+    log(true_negative/true_positive) - log(sample_negative/sample_positive)
+    so raw predicted probabilities are calibrated to the true population
+    rate instead of the cache's balanced rate. Only touches the bias term;
+    apply it once after training, before generating predictions.
+
+    true_negative, true_positive: counts from the full population
+        (population_stats.json). sample_negative, sample_positive: counts
+        actually kept in the cache (train_pool_cache/manifest.json).
+    """
+    correction = math.log(true_negative / true_positive) - math.log(sample_negative / sample_positive)
+    with torch.no_grad():
+        model.model[-1].bias += correction
+    return model
