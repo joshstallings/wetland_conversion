@@ -1,5 +1,5 @@
 """
-Spatial CV fold assignment (data_pipeline_recipe_path_b.md step 2). Fold
+Spatial CV fold assignment (data_pipeline_recipe.md step 2). Fold
 assignment is a runtime random draw from a seed, not a saved file, so which
 blocks land in val changes every run unless the same seed is reused.
 """

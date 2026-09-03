@@ -1,10 +1,11 @@
-<title>Path B recipe: full-data streaming with weighted loss</title>
+<title>Streaming recipe: full-data streaming with weighted loss</title>
 
-# Path B recipe: full-data streaming with weighted loss
+# Streaming recipe: full-data streaming with weighted loss
 
 Implementation recipe for training on every row, no undersampling, using a
 shuffle-buffer stream and a class-weighted loss instead of a stratified
-sampler.
+sampler. This is the project's only training pipeline; an earlier
+negative-undersampled cache approach was tried and dropped.
 
 Target machine has 16GB RAM and 726GB free disk. Source data is 59.27M rows,
 193 features, 1727 spatial blocks (~10km each), true positive rate 0.28%
@@ -202,13 +203,10 @@ if so.
 
 ## Step 6: `StreamingDataModule`
 
-Named `StreamingDataModule`, not `SpatialCVDataModule` — path A's
-DataModule (`data_pipeline_recipe_path_a.md` step 5) needs a different
-constructor (`cache_dir`/`pos_frac` instead of `buffer_size`), so it can't
-share this class or this name. `train.py`'s unified entry point (step 7
-below) imports both under these distinct names.
+Named `StreamingDataModule`, not `SpatialCVDataModule`, since it's specific
+to the streaming approach this recipe describes.
 
-Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, cols_to_normalize, source_parquet_path, population_stats_path="data/population_stats.json", batch_size, buffer_size=300_000)`. No `pos_frac` here (that parameter belongs to path A's stratified batch sampler); `pos_weight` lives on the model (step 5), not the DataModule. `cols_to_normalize` is `features.COLS_TO_NORMALIZE`, passed through to step 3's normalization pass.
+Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, cols_to_normalize, source_parquet_path, population_stats_path="data/population_stats.json", batch_size, buffer_size=300_000)`. `pos_weight` lives on the model (step 5), not the DataModule. `cols_to_normalize` is `features.COLS_TO_NORMALIZE`, passed through to step 3's normalization pass.
 
 - `setup()`: load `population_stats.json`, call `assign_folds` from step 2
   with the given seed and its `block_row_counts`, split into this fold's
@@ -221,25 +219,14 @@ Constructor: `(seed, n_splits, fold_idx, feature_cols, label_col, cols_to_normal
 
 ## Step 7: `train.py`'s `main()`
 
-`train.py` is shared with path A (`data_pipeline_recipe_path_a.md`), not a
-separate script per path — the two pipelines differ only in which
-DataModule gets built and where results land. Everything else (the seeded
+`train.py` builds a `StreamingDataModule` (step 6) with `buffer_size` and
+writes results under `results/streaming/`. Everything else (the seeded
 fold, `models.SimpleLinearModel`, `reporting.py`'s plots and
-`write_fold_summary`) is common code both branches call into. A `PIPELINE`
-selector (`streaming` / `cached_pool` — a module constant or a
-`--pipeline` CLI flag) at the top of `main()` picks between them:
-
-- `streaming`: build `StreamingDataModule` (step 6) with `buffer_size`,
-  write results under `results/streaming/`.
-- `cached_pool`: build `CachedPoolDataModule` (path A step 5) with
-  `cache_dir`/`pos_frac`, write results under `results/cached_pool/`.
-
-The rest of this step describes the `streaming` branch specifically:
+`write_fold_summary`) is common code the loop calls into.
 
 - Fix a single `SEED` for the run (the design decision section above covers
   why fold assignment is a runtime draw rather than a saved file — pick one
-  and log it; the same `SEED` under the `cached_pool` branch produces the
-  same fold split, which is what step 8's cross-path comparison relies on).
+  and log it).
 - Loop over `n_splits` folds for that seed, writing to
   `results/streaming/fold_{k}/`. Write `results/streaming/manifest.json`
   with the seed and the per-fold block/row/positive counts from step 2's

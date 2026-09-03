@@ -280,3 +280,17 @@ class StreamingDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=0)
+
+    def train_eval_dataloader(self):
+        """Natural-rate, single-pass stream over the train blocks -- for scoring
+        the fitted model on its own training data, not for training. Deliberately
+        StreamingValDataset rather than train_dataloader()/StreamingTrainDataset:
+        train_dataloader's shuffle buffer happens to also yield every row exactly
+        once, but that's an implementation detail of the buffer, not something to
+        lean on for eval. This way train and val eval both go through the same
+        class at the same true positive rate, so their PR curves are comparable."""
+        train_eval_ds = StreamingValDataset(
+            self.source_parquet_path, self.feature_cols, self.label_col,
+            self.train_block_ids, self.mean, self.std,
+        )
+        return DataLoader(train_eval_ds, batch_size=self.batch_size, num_workers=0)

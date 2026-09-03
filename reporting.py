@@ -74,18 +74,28 @@ def plot_confusion_matrix(labels, probs, threshold, out_path, title):
     return cm
 
 
-def plot_pr_curve(labels, probs, out_path, title):
-    precision, recall, _ = precision_recall_curve(labels, probs)
-    ap = average_precision_score(labels, probs)
+def plot_pr_curve_train_val(train_labels, train_probs, val_labels, val_probs, out_path, title):
+    """Train and val PR curves on one axes, so the overfit gap is a single
+    glance instead of two separate PNGs you'd have to hold in your head
+    together. Train sits at the true population positive rate here too (see
+    each DataModule's train_eval_dataloader), so the two AUPRCs are directly
+    comparable, not apples to oranges."""
+    train_precision, train_recall, _ = precision_recall_curve(train_labels, train_probs)
+    train_ap = average_precision_score(train_labels, train_probs)
+    val_precision, val_recall, _ = precision_recall_curve(val_labels, val_probs)
+    val_ap = average_precision_score(val_labels, val_probs)
+
     fig, ax = plt.subplots()
-    ax.plot(recall, precision, label=f"AUPRC = {ap:.3f}")
+    ax.plot(val_recall, val_precision, color="#0072B2", label=f"validation (AUPRC = {val_ap:.3f})")
+    ax.plot(train_recall, train_precision, color="#D55E00", linestyle="--",
+            label=f"train (AUPRC = {train_ap:.3f})")
     ax.set_xlabel("recall")
     ax.set_ylabel("precision")
     ax.set_title(title)
     ax.legend()
     fig.savefig(out_path)
     plt.close(fig)
-    return ap
+    return train_ap, val_ap
 
 
 def score_fold(labels, probs, threshold=0.5):
@@ -116,6 +126,8 @@ def write_fold_summary(rows, out_path):
     df.to_csv(out_path, index=False)
 
     metric_cols = ["precision", "recall", "f1", "auprc"]
+    train_metric_cols = [f"train_{c}" for c in metric_cols if f"train_{c}" in df.columns]
+    metric_cols = metric_cols + train_metric_cols
     print(df)
     print("\nmean, std across folds:")
     print(df[metric_cols].agg(["mean", "std"]))
