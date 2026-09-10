@@ -1,296 +1,286 @@
 """
-Dataset classes for the training pipeline.
-everything streams straight from the source parquet, nothing is cached or
-downsampled to disk. Fold assignment (folds.assign_folds) lives in its own
-module since it's also used standalone for the pre-training fold log in
-train.py.
+Datasets, batch samplers and the DataModule for the array pipeline. Everything
+reads from data/arrays through arrays.py; nothing here touches the source
+parquet.
+
 """
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.dataset as ds
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, get_worker_info
 
-from folds import assign_folds
-from label_utils import binarize_label
-from population_stats import load_population_stats
+import arrays as array_io
 
 
-def _read_feature_matrix(batch, feature_cols):
-    """pyarrow RecordBatch -> float32 (n_rows, n_features) array, column order
-    matching feature_cols."""
-    return np.stack(
-        [batch.column(c).to_numpy(zero_copy_only=False) for c in feature_cols],
-        axis=1,
-    ).astype(np.float32)
-
-
-def _block_id_filter(block_ids):
-    """pyarrow.dataset filter expression selecting rows whose block_id is in
-    block_ids. Shared by the normalization pass and both streaming datasets so
-    the predicate pushdown behavior is identical everywhere it's used.
-    block_id is a string in the source parquet (e.g. "b0239_0323"), not an int."""
-    return pc.field("block_id").isin(pa.array(list(block_ids), type=pa.large_string()))
-
-
-def _to_tensors(x_row, y_row):
-    return torch.from_numpy(x_row), torch.tensor(y_row, dtype=torch.float32)
-
-
-def compute_normalization_stats(source_parquet_path, feature_cols, block_ids, cols_to_normalize,
-                                 batch_size=65_536):
+def dist_norm_stats(arrays, is_train):
     """
-    One streaming pass over just this fold's train blocks to get mean/std for
-    cols_to_normalize (a subset of feature_cols -- see features.COLS_TO_NORMALIZE:
-    dist_to_developed_2019_m is on a meters scale, the AlphaEarth embedding dims
-    are already roughly unit scaled and don't need this). Rows with NaN/inf in
-    any of cols_to_normalize (coastal/boundary tiles are the likely source) are
-    dropped from the running stats rather than left to poison them.
+    Mean and std of dist_to_developed_2019_m over this fold's train rows.
 
-    Always compute this from train rows only and reuse the result for val too
-    (never recompute from val) -- val's own statistics would leak its
-    distribution into the model's input scale.
+    Train rows only, always, and the same numbers get reused for val. Computing it
+    from val too would leak val's distribution into the model's input scale. This
+    is also why the array artifact stores dist in raw meters: normalization stats
+    are a fold dependent quantity, so baking them into the file would freeze one
+    fold's answer into an artifact shared by all five.
 
-    Returns (mean, std), both float32 arrays shaped (len(feature_cols),) so they
-    line up with the full feature matrix. Columns not in cols_to_normalize get
-    mean 0 / std 1, a no-op under (x - mean) / std.
+    Replaces the streaming path's filtered parquet scan with two reductions over
+    one 237 MB array. Rows that are not finite are excluded and the count is
+    printed rather than silently dropped, which is what the old per batch version
+    did. build_arrays.py measured zero of them across the whole array, so this
+    warning should never fire.
     """
-    dataset = ds.dataset(source_parquet_path, format="parquet")
-    filt = _block_id_filter(block_ids)
+    dist = arrays["dist"]
+    finite = np.isfinite(dist)
+    n_bad = int(np.sum(is_train & ~finite))
+    if n_bad:
+        print(f"WARNING: {n_bad:,} train rows have a dist that is not finite, excluded from mean/std")
 
-    n_norm = len(cols_to_normalize)
-    count = 0
+    mask = is_train & finite
+    n = int(mask.sum())
+    if n < 2:
+        raise ValueError(f"only {n} finite train rows for the dist normalization stats")
 
-    mean = np.zeros(n_norm, dtype=np.float64)
-    m2 = np.zeros(n_norm, dtype=np.float64)
-
-    for batch in dataset.to_batches(columns=cols_to_normalize, filter=filt, batch_size=batch_size):
-        x = _read_feature_matrix(batch, cols_to_normalize).astype(np.float64)
-
-        finite_mask = np.all(np.isfinite(x), axis=1)
-        n_bad = int(finite_mask.size - finite_mask.sum())
-        if n_bad:
-            print(f"normalization pass: dropping {n_bad} rows with NaN/inf feature values")
-        x = x[finite_mask]
-        if len(x) == 0:
-            continue
-
-        batch_count = len(x)
-        batch_mean = x.mean(axis=0)
-        batch_m2 = ((x - batch_mean) ** 2).sum(axis=0)
-
-        delta = batch_mean - mean
-        total_count = count + batch_count
-        mean = mean + delta * (batch_count / total_count)
-        m2 = m2 + batch_m2 + delta**2 * count * batch_count / total_count
-        count = total_count
-
-    if count < 2:
-        raise ValueError("fewer than 2 finite rows seen while computing normalization stats")
-
-    std = np.sqrt(m2 / (count - 1))
-    std[std == 0] = 1.0  # guard a constant column against divide by zero
-
-    mean_full = np.zeros(len(feature_cols), dtype=np.float32)
-    std_full = np.ones(len(feature_cols), dtype=np.float32)
-    norm_idx = [feature_cols.index(c) for c in cols_to_normalize]
-    mean_full[norm_idx] = mean.astype(np.float32)
-    std_full[norm_idx] = std.astype(np.float32)
-    return mean_full, std_full
+    mean = float(np.mean(dist, where=mask, dtype=np.float64))
+    std = float(np.std(dist, where=mask, dtype=np.float64))
+    if std == 0:
+        std = 1.0  # guard a constant column against divide by zero
+    return np.float32(mean), np.float32(std)
 
 
-class StreamingTrainDataset(IterableDataset):
+class GatherDataset:
     """
-    Streams every row from the source parquet for this fold's train blocks.
-    Positive rebalancing happens in the loss (models.SimpleLinearModel's pos_weight),
-    not here, so batches are plain shuffled draws that average close to the true 0.28% 
-    positive rate; don't expect every batch to contain a positive.
+    Random access rows by index array. __getitem__ takes a whole batch of row
+    indices, not one index.
 
-    Approximates a full shuffle with a reservoir-style shuffle buffer (the same
-    trick tf.data's shuffle() and WebDataset use) instead of holding the whole
-    fold in memory. Rows arrive from parquet roughly in spatial (tile) order, so
-    buffer_size has to span more than one source file or batches stay spatially
-    clustered.
-
-    The swap is done a batch at a time (one rng.choice() draw and one gather/
-    scatter over the whole batch) instead of one draw and one buffer[slot] per
-    row -- profiling a live training run showed the old per-row Python loop, not
-    the parquet read itself, was the dominant cost of __iter__. Slots are drawn
-    without replacement within a batch so every incoming row still gets a slot
-    and every evicted row is yielded exactly once, same as the row-by-row
-    version -- sampling with replacement would let two draws in one batch pick
-    the same slot, which silently drops one of the new rows and duplicates the
-    evicted one.
+    Returns (emb float16 (B, 192), dist float32 (B,), label float32 (B,)).
     """
 
-    def __init__(self, source_parquet_path, feature_cols, label_col, train_block_ids,
-                 mean, std, buffer_size=300_000):
-        self.source_parquet_path = source_parquet_path
-        self.feature_cols = list(feature_cols)
-        self.label_col = label_col
-        self.train_block_ids = list(train_block_ids)
-        self.mean = np.asarray(mean, dtype=np.float32)
-        self.std = np.asarray(std, dtype=np.float32)
-        self.buffer_size = buffer_size
+    def __init__(self, arrays, dist_mean, dist_std):
+        self.emb = arrays["emb"]
+        self.dist = arrays["dist"]
+        self.label = arrays["label"]
+        self.dist_mean = np.float32(dist_mean)
+        self.dist_std = np.float32(dist_std)
 
-    def __iter__(self):
-        dataset = ds.dataset(self.source_parquet_path, format="parquet")
-        filt = _block_id_filter(self.train_block_ids)
-        columns = self.feature_cols + [self.label_col, "block_id"]
+    def __len__(self):
+        return self.emb.shape[0]
 
-        rng = np.random.default_rng()
-        buffer_x = np.empty((self.buffer_size, len(self.feature_cols)), dtype=np.float32)
-        buffer_y = np.empty(self.buffer_size, dtype=np.float32)
-        filled = 0  # how many buffer slots hold real rows, until the buffer's topped up
-
-        for batch in dataset.to_batches(columns=columns, filter=filt):
-            x = (_read_feature_matrix(batch, self.feature_cols) - self.mean) / self.std
-            raw_label = batch.column(self.label_col).to_numpy(zero_copy_only=False)
-            y = binarize_label(raw_label)
-
-            # top up the buffer directly from this batch before any swapping starts
-            if filled < self.buffer_size:
-                n_fill = min(len(x), self.buffer_size - filled)
-                buffer_x[filled:filled + n_fill] = x[:n_fill]
-                buffer_y[filled:filled + n_fill] = y[:n_fill]
-                filled += n_fill
-                x, y = x[n_fill:], y[n_fill:]
-
-            # buffer's full: swap the rest of this batch in chunks no bigger than
-            # buffer_size (chunking only ever triggers if a single parquet batch
-            # somehow outgrows the buffer, buffer_size defaults to 300_000)
-            for start in range(0, len(x), self.buffer_size):
-                x_chunk = x[start:start + self.buffer_size]
-                y_chunk = y[start:start + self.buffer_size]
-
-                # sample slots *without* replacement -- with replacement, a slot
-                # drawn twice in the same chunk would evict the same old row
-                # twice (a duplicate in the output stream) and silently drop
-                # whichever new row didn't get scattered last, instead of every
-                # input row appearing exactly once in the output
-                slots = rng.choice(self.buffer_size, size=len(x_chunk), replace=False)
-                evicted_x = buffer_x[slots]
-                evicted_y = buffer_y[slots]
-                buffer_x[slots] = x_chunk
-                buffer_y[slots] = y_chunk
-
-                for i in range(len(slots)):
-                    yield _to_tensors(evicted_x[i], evicted_y[i])
-
-        # stream ended before the buffer filled (small fold, or buffer_size set
-        # too large) -- only shuffle and drain the slots that actually got written
-        order = rng.permutation(filled)
-        for i in order:
-            yield _to_tensors(buffer_x[i], buffer_y[i])
+    def __getitem__(self, idx):
+        emb = self.emb[idx]
+        dist = (self.dist[idx] - self.dist_mean) / self.dist_std
+        y = self.label[idx].astype(np.float32)
+        return torch.from_numpy(emb), torch.from_numpy(dist), torch.from_numpy(y)
 
 
-class StreamingValDataset(IterableDataset):
+class SpanDataset:
     """
-    Validation stream at the source parquet's true 0.28% positive rate.
-    never downsampled, never shuffle-buffered (order doesn't matter, this just
-    accumulates predictions to score once). Normalized with the *train* fold's
-    mean/std, never its own, or val's distribution leaks into the model's input
-    scale. A separate class from StreamingTrainDataset even though both stream
-    from the same source, since val never sees pos_weight or any other
-    training-only concern.
+    Sequential reads over (start, stop) row spans, for validation and for scoring.
+    One item is one span, already batch sized.
+
+    Validation gets its own class because it reads slices rather than gathering.
+    The array is block contiguous, so a fold's val rows are a few hundred
+    contiguous spans, and a slice of the memmap is one sequential read instead of
+    8,192 scattered ones. arrays.build_fold_index chops the spans into chunks.
+
+    np.array() rather than a bare slice because np.load(mmap_mode="r") hands back
+    a read only array.
     """
 
-    def __init__(self, source_parquet_path, feature_cols, label_col, val_block_ids, mean, std):
-        self.source_parquet_path = source_parquet_path
-        self.feature_cols = list(feature_cols)
-        self.label_col = label_col
-        self.val_block_ids = list(val_block_ids)
-        self.mean = np.asarray(mean, dtype=np.float32)
-        self.std = np.asarray(std, dtype=np.float32)
+    def __init__(self, arrays, chunks, dist_mean, dist_std):
+        self.emb = arrays["emb"]
+        self.dist = arrays["dist"]
+        self.label = arrays["label"]
+        self.chunks = np.asarray(chunks, dtype=np.int64).reshape(-1, 2)
+        self.dist_mean = np.float32(dist_mean)
+        self.dist_std = np.float32(dist_std)
 
-    def __iter__(self):
-        dataset = ds.dataset(self.source_parquet_path, format="parquet")
-        filt = _block_id_filter(self.val_block_ids)
-        columns = self.feature_cols + [self.label_col, "block_id"]
+    def __len__(self):
+        return len(self.chunks)
 
-        for batch in dataset.to_batches(columns=columns, filter=filt):
-            x = (_read_feature_matrix(batch, self.feature_cols) - self.mean) / self.std
-            raw_label = batch.column(self.label_col).to_numpy(zero_copy_only=False)
-            y = binarize_label(raw_label)
+    @property
+    def n_rows(self):
+        return int((self.chunks[:, 1] - self.chunks[:, 0]).sum())
 
-            for i in range(len(y)):
-                yield _to_tensors(x[i], y[i])
+    def __getitem__(self, i):
+        start, stop = self.chunks[i]
+        emb = np.array(self.emb[start:stop])
+        dist = (self.dist[start:stop] - self.dist_mean) / self.dist_std
+        y = self.label[start:stop].astype(np.float32)
+        return torch.from_numpy(emb), torch.from_numpy(dist), torch.from_numpy(y)
 
 
-class StreamingDataModule(pl.LightningDataModule):
+class StratifiedBatchSampler:
     """
-    Train and val both stream from the source parquet, train through a shuffle
-    buffer (StreamingTrainDataset), val at the natural rate
-    (StreamingValDataset). No stratified batch sampler here, positive
-    rebalancing happens in the loss (models.SimpleLinearModel's pos_weight)
-    instead of the batch composition.
+    Composes every batch with a fixed positive to negative ratio, drawing from
+    this fold's train rows. Yields int32 index arrays, one per batch.
 
-    cols_to_normalize is the subset of feature_cols that actually gets
-    mean/std normalized (see features.COLS_TO_NORMALIZE); every other column
-    passes through compute_normalization_stats unchanged.
+    Positives are drawn without replacement within an epoch and reshuffled if
+    steps_per_epoch asks for more than one pass. Negatives are drawn with
+    replacement: at 1,984 per batch out of 47M, the expected number of duplicates
+    in a batch is 0.04, and permuting a 47M element array every epoch to avoid
+    that is not worth it.
     """
 
-    def __init__(self, seed, n_splits, fold_idx, feature_cols, label_col, cols_to_normalize,
-                 source_parquet_path, population_stats_path="data/population_stats.json",
-                 batch_size=256, buffer_size=300_000):
-        super().__init__()
-        self.seed = seed
-        self.n_splits = n_splits
-        self.fold_idx = fold_idx
-        self.feature_cols = list(feature_cols)
-        self.label_col = label_col
-        self.cols_to_normalize = list(cols_to_normalize)
-        self.source_parquet_path = source_parquet_path
-        self.population_stats_path = population_stats_path
+    def __init__(self, train_pos, train_neg, batch_size=2048, pos_per_batch=64,
+                 steps_per_epoch=None, seed=0):
+        if not 0 < pos_per_batch < batch_size:
+            raise ValueError(f"pos_per_batch {pos_per_batch} must be in (0, {batch_size})")
+        self.train_pos = train_pos
+        self.train_neg = train_neg
         self.batch_size = batch_size
-        self.buffer_size = buffer_size
+        self.pos_per_batch = pos_per_batch
+        self.neg_per_batch = batch_size - pos_per_batch
+        self.seed = seed
+        self.steps_per_epoch = (
+            steps_per_epoch if steps_per_epoch is not None
+            else max(train_pos.size // pos_per_batch, 1)
+        )
+        self._epoch = 0
+
+    @property
+    def batch_pos_weight(self):
+        """Residual negative to positive ratio still present in a batch after
+        stratifying. Not wired into the loss by default, since focal loss is doing
+        that job, but it is the right value if you ever pass one."""
+        return self.neg_per_batch / self.pos_per_batch
+
+    @property
+    def batch_positive_rate(self):
+        return self.pos_per_batch / self.batch_size
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def __iter__(self):
+        # Seeded off (seed, epoch) so every epoch draws differently and the whole
+        # run still reproduces from SEED alone. Lightning calls __iter__ once per
+        # epoch, which is what makes the counter safe.
+        rng = np.random.default_rng([self.seed, self._epoch])
+        self._epoch += 1
+
+        pos_order = rng.permutation(self.train_pos.size)
+        cursor = 0
+        for _ in range(self.steps_per_epoch):
+            if cursor + self.pos_per_batch > pos_order.size:
+                pos_order = rng.permutation(self.train_pos.size)
+                cursor = 0
+            pos = self.train_pos[pos_order[cursor:cursor + self.pos_per_batch]]
+            cursor += self.pos_per_batch
+
+            neg = self.train_neg[rng.integers(0, self.train_neg.size, self.neg_per_batch)]
+
+            batch = np.concatenate([pos, neg])
+            rng.shuffle(batch)
+            yield batch
+
+
+class SequentialIndexSampler:
+    """
+    Walks a fixed row index array in order, batch_size at a time. For scoring a
+    fitted model over a chosen set of rows, not for training.
+    """
+
+    def __init__(self, row_idx, batch_size):
+        self.row_idx = np.asarray(row_idx, dtype=np.int32)
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return (self.row_idx.size + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        for start in range(0, self.row_idx.size, self.batch_size):
+            yield self.row_idx[start:start + self.batch_size]
+
+
+def _populate_worker(worker_id):
+    info = get_worker_info()
+    emb = getattr(info.dataset, "emb", None)
+    if emb is not None and isinstance(emb, np.memmap):
+        emb.reshape(-1).view(np.uint8)[::array_io.PAGE_BYTES].sum()
+
+
+class ArrayDataModule(pl.LightningDataModule):
+    """
+    One fold's loaders over the array artifact.
+    """
+
+    def __init__(self, arrays, manifest, fold_code, fold_idx, batch_size=2048,
+                 pos_per_batch=64, steps_per_epoch=None, val_batch_rows=8192,
+                 train_eval_stride=10, num_workers=0, seed=0):
+        super().__init__()
+        self.arrays = arrays
+        self.manifest = manifest
+        self.fold_code = fold_code
+        self.fold_idx = fold_idx
+        self.batch_size = batch_size
+        self.pos_per_batch = pos_per_batch
+        self.steps_per_epoch = steps_per_epoch
+        self.val_batch_rows = val_batch_rows
+        self.train_eval_stride = train_eval_stride
+        self.num_workers = num_workers
+        self.seed = seed
 
     def setup(self, stage=None):
-        population_stats = load_population_stats(self.population_stats_path)
+        # Everything is built for every stage at once, so this is guarded rather
+        # than rebuilt per stage: train.py calls setup() itself to read
+        # batch_pos_weight before constructing the model, and Trainer.fit would
+        # otherwise redo the 0.7 second index build immediately afterwards.
+        if getattr(self, "index", None) is not None:
+            return
 
-        self.fold_assignment = assign_folds(
-            population_stats["block_row_counts"], self.n_splits, self.seed
+        self.index = array_io.build_fold_index(
+            self.arrays, self.manifest, self.fold_code, self.fold_idx,
+            val_chunk_rows=self.val_batch_rows,
         )
-        all_blocks = np.array(list(self.fold_assignment.keys()), dtype=object)
-        fold_of_block = np.array(list(self.fold_assignment.values()), dtype=np.int64)
-        self.val_block_ids = all_blocks[fold_of_block == self.fold_idx].tolist()
-        self.train_block_ids = all_blocks[fold_of_block != self.fold_idx].tolist()
+        self.dist_mean, self.dist_std = dist_norm_stats(self.arrays, self.index.is_train)
 
-        self.mean, self.std = compute_normalization_stats(
-            self.source_parquet_path, self.feature_cols, self.train_block_ids, self.cols_to_normalize
+        self.gather_ds = GatherDataset(self.arrays, self.dist_mean, self.dist_std)
+        self.val_ds = SpanDataset(
+            self.arrays, self.index.val_chunks, self.dist_mean, self.dist_std
+        )
+        self.train_sampler = StratifiedBatchSampler(
+            self.index.train_pos, self.index.train_neg,
+            batch_size=self.batch_size, pos_per_batch=self.pos_per_batch,
+            steps_per_epoch=self.steps_per_epoch, seed=self.seed + self.fold_idx,
         )
 
-        self.train_ds = StreamingTrainDataset(
-            self.source_parquet_path, self.feature_cols, self.label_col,
-            self.train_block_ids, self.mean, self.std, buffer_size=self.buffer_size,
-        )
-        self.val_ds = StreamingValDataset(
-            self.source_parquet_path, self.feature_cols, self.label_col,
-            self.val_block_ids, self.mean, self.std,
+        # Scoring the fitted model on its own training blocks needs the natural
+        # 0.28% rate, or the train AUPRC is not comparable to val. A strided
+        # subsample of the train rows keeps that rate in expectation and cuts 47M
+        # rows to 4.7M. Strided rather than random because the rows are block
+        # ordered, so a stride stays spatially uniform and reads mostly sequentially.
+        train_rows = np.flatnonzero(self.index.is_train).astype(np.int32)
+        self.train_eval_idx = train_rows[::self.train_eval_stride]
+
+    @property
+    def batch_pos_weight(self):
+        """See StratifiedBatchSampler.batch_pos_weight. Unused unless
+        train.POS_WEIGHT is set."""
+        return self.train_sampler.batch_pos_weight
+
+    def _loader(self, dataset, sampler):
+        return DataLoader(
+            dataset,
+            batch_size=None,  # disables automatic batching: the sampler yields whole batches
+            sampler=sampler,
+            num_workers=self.num_workers,
+            worker_init_fn=_populate_worker if self.num_workers else None,
+            persistent_workers=bool(self.num_workers),
         )
 
     def train_dataloader(self):
-        # IterableDataset doesn't support a sampler. num_workers=0: sharding an
-        # IterableDataset across worker processes needs get_worker_info() bookkeeping
-        # that isn't worth the complexity until an actual IO stall is measured.
-        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=0)
+        return self._loader(self.gather_ds, self.train_sampler)
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=0)
+        # No sampler: SpanDataset items are already batches, in array order, so the
+        # default sequential pass over them is exactly the sweep we want.
+        return DataLoader(self.val_ds, batch_size=None, num_workers=0)
 
     def train_eval_dataloader(self):
-        """Natural-rate, single-pass stream over the train blocks -- for scoring
-        the fitted model on its own training data, not for training. Deliberately
-        StreamingValDataset rather than train_dataloader()/StreamingTrainDataset:
-        train_dataloader's shuffle buffer happens to also yield every row exactly
-        once, but that's an implementation detail of the buffer, not something to
-        lean on for eval. This way train and val eval both go through the same
-        class at the same true positive rate, so their PR curves are comparable."""
-        train_eval_ds = StreamingValDataset(
-            self.source_parquet_path, self.feature_cols, self.label_col,
-            self.train_block_ids, self.mean, self.std,
+        """Natural rate single pass over a subsample of the train rows, for scoring
+        the fitted model on its own training data. Deliberately not
+        train_dataloader(): those batches are stratified to 1:31, so precision and
+        recall off them are not comparable to anything measured on val."""
+        return self._loader(
+            self.gather_ds, SequentialIndexSampler(self.train_eval_idx, self.val_batch_rows)
         )
-        return DataLoader(train_eval_ds, batch_size=self.batch_size, num_workers=0)

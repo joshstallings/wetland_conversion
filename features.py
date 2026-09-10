@@ -41,6 +41,15 @@ FEATURE_COLS = [
 # them too would just be extra noise on top of a scale that's already fine.
 COLS_TO_NORMALIZE = ["dist_to_developed_2019_m"]
 
+# The array artifact (build_arrays.py) splits the features into two files: the
+# 192 embedding dims as float16 and the one meters scale column as float32. This
+# is the single definition of that split. arrays.load_arrays asserts the stored
+# manifest's column list equals EMB_COLS element by element, so changing
+# FEATURE_COLS invalidates data/arrays and crashes on load instead of quietly
+# training on scrambled columns.
+DIST_COL = "dist_to_developed_2019_m"
+EMB_COLS = [c for c in FEATURE_COLS if c != DIST_COL]
+
 # Raw column is three valued: 0 remained wetland, 1 converted to developed,
 # 2 converted to other (non-developed). The binary target folds 0 and 2 into
 # negative -- see label_utils.binarize_label for where that happens.
