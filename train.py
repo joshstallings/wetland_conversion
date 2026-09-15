@@ -10,6 +10,7 @@ Run order from scratch:
 
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pytorch_lightning as pl
@@ -25,7 +26,7 @@ from folds import assign_folds, log_fold_stats
 from population_stats import POPULATION_STATS_PATH, load_population_stats
 
 ARRAY_DIR = array_io.ARRAY_DIR
-RESULTS_DIR = Path("results/mlp_batch_size_256")
+RESULTS_DIR = Path("results/tcn_batch_size_2048")
 
 SEED = 0
 N_SPLITS = 5
@@ -41,12 +42,12 @@ GAMMA = 2.0
 # data_module.batch_pos_weight (31) only as a deliberate ablation.
 POS_WEIGHT = None
 
-BATCH_SIZE = 256
+BATCH_SIZE = 2048
 # 64 in 2048 is a 1 in 32 positive rate, against 1 in 356 in the population. This
 # is the number to move first if the model is starved of positives or, in the
 # other direction, if it starts overfitting the 165,908 positives it now sees
 # many times per epoch.
-POS_PER_BATCH = 8
+POS_PER_BATCH = 64
 
 # None means one pass over this fold's train positives per epoch, about 2,100
 # batches. An epoch is a choice now, not a pass over the data.
@@ -74,9 +75,7 @@ def run_fold(fold_idx, data_module, fold_dir):
     index and normalization stats.
     """
     index = data_module.index
-    model = models.MultiLayerPerceptron(
-        len(FEATURE_COLS), lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA
-    )
+    model = models.TemporalConvolutionalNetwork(lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA)
 
     fold_dir.mkdir(parents=True, exist_ok=True)
     fold_name = f"fold_{fold_idx}"
@@ -97,7 +96,7 @@ def run_fold(fold_idx, data_module, fold_dir):
     # EarlyStopping.
     epochs_run = trainer.current_epoch
 
-    best_model = models.MultiLayerPerceptron.load_from_checkpoint(checkpoint.best_model_path)
+    best_model = models.TemporalConvolutionalNetwork.load_from_checkpoint(checkpoint.best_model_path)
 
     probs, labels = reporting.get_val_predictions(best_model, data_module.val_dataloader())
     np.savez(fold_dir / "val_preds.npz", probs=probs, labels=labels)
@@ -114,7 +113,7 @@ def run_fold(fold_idx, data_module, fold_dir):
     metrics_csvs = sorted(fold_dir.glob("**/metrics.csv"))
     if metrics_csvs:
         reporting.plot_loss_curve(
-            metrics_csvs[-1], fold_dir / "loss_curve.png", f"fold {fold_idx}: training loss",
+            metrics_csvs[-1], fold_dir / "loss_curve.png", f"fold {fold_idx} loss",
         )
 
     reporting.plot_confusion_matrix(
@@ -132,6 +131,7 @@ def run_fold(fold_idx, data_module, fold_dir):
     fold_score.update({
         "fold": fold_idx,
         "epochs_run": epochs_run,
+        "checkpoint_path": checkpoint.best_model_path
         "n_train_blocks": index.n_train_blocks,
         "n_val_blocks": index.n_val_blocks,
         "n_train_rows": index.n_train_rows,
@@ -255,9 +255,38 @@ def main():
     with open(RESULTS_DIR / "manifest.json", "w") as f:
         json.dump(run_manifest, f, indent=2)
 
+    # Across fold figures live out here
+    fold_dirs = [RESULTS_DIR / f"fold_{i}" for i in range(N_SPLITS)]
+    metrics_csvs = [c for d in fold_dirs for c in sorted(d.glob("**/metrics.csv"))[-1:]]
+    if metrics_csvs:
+        reporting.plot_mean_loss_curve(
+            metrics_csvs,
+            RESULTS_DIR / "loss_curve_mean.png",
+            f"Mean training and validation loss over",
+            ylabel="focal loss" if GAMMA is not None else "BCE loss",
+        )
+
+    fold_preds = []
+    for d in fold_dirs:
+        train_npz = np.load(d / "train_preds.npz")
+        val_npz = np.load(d / "val_preds.npz")
+        fold_preds.append(
+            (train_npz["labels"], train_npz["probs"], val_npz["labels"], val_npz["probs"])
+        )
+    reporting.plot_mean_pr_curve(
+        fold_preds,
+        RESULTS_DIR / "pr_curve_mean.png",
+        f"Mean precision recall curve over {N_SPLITS} spatially blocked folds",
+    )
+
     print("\n=== fold summary ===")
     reporting.write_fold_summary(all_fold_rows, RESULTS_DIR / "fold_summary.csv")
 
+    # get the best model
+    best_fold = max(all_fold_rows, key=lambda row: row["auprc"])
+    best_checkpoint_src = Path(best_fold["checkpoint_path"])
+    best_checkpoint_dst = RESULTS_DIR / "best_model.ckpt"
+    shutil.copy2(best_checkpoint_src, best_checkpoint_dst)
 
 if __name__ == "__main__":
     main()

@@ -247,3 +247,88 @@ class MultiLayerPerceptron(pl.LightningModule):
 
     def configure_optimizers(self):
         return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+    
+class TemporalConvolutionalNetwork(pl.LightningModule):
+    def __init__(self, emb_dim=64, hidden_dim=128, dropout=0.3, lr=1e-3, threshold=0.5,
+                 pos_weight=None, gamma=2.0, alpha=None, weight_decay=0.0, kernel_size=2):
+        super().__init__()
+        self.save_hyperparameters()
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        self.tcn_block = nn.Sequential(nn.Conv1d(emb_dim, hidden_dim, kernel_size=kernel_size), 
+                                       nn.BatchNorm1d(hidden_dim), nn.ReLU(),
+                                       nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size),
+                                       nn.BatchNorm1d(hidden_dim), nn.ReLU())
+        self.model = nn.Sequential(
+            nn.Linear(hidden_dim+1, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        self.loss_fn = BinaryFocalLoss(gamma=gamma, alpha=alpha, pos_weight=pos_weight)
+        self.train_precision = BinaryPrecision(threshold=threshold)
+        self.train_recall = BinaryRecall(threshold=threshold)
+        self.train_f1 = BinaryF1Score(threshold=threshold)
+
+        self.val_precision = BinaryPrecision(threshold=threshold)
+        self.val_recall = BinaryRecall(threshold=threshold)
+        self.val_f1 = BinaryF1Score(threshold=threshold)
+
+    def forward(self, emb, dist):
+        # emb is shape (B, 192) need to reshape to (B, 3, 64) and then transpose. 
+        # bc Conv1D takes (channels, length)
+        emb = emb.float()
+        reshaped_emb = emb.view(-1, 3, self.hparams.emb_dim)
+        transpose_emb = reshaped_emb.transpose(1, 2)
+        tcn_out = self.tcn_block(transpose_emb)
+
+        aap_output = self.pool(tcn_out).squeeze(-1)
+
+        head_input = torch.cat([dist.unsqueeze(1), aap_output], dim=1)
+        return self.model(head_input)
+
+
+    def training_step(self, batch, batch_idx):
+        emb, dist, y = batch
+        logits = self(emb, dist).squeeze(1)
+        loss = self.loss_fn(logits, y)
+
+        probs = torch.sigmoid(logits)
+        self.train_precision(probs, y.int())
+        self.train_recall(probs, y.int())
+        self.train_f1(probs, y.int())
+
+        self.log("train_loss", loss, on_step=False, on_epoch=True)
+        self.log("train_precision", self.train_precision, on_step=False, on_epoch=True)
+        self.log("train_recall", self.train_recall, on_step=False, on_epoch=True)
+        self.log("train_f1", self.train_f1, on_step=False, on_epoch=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        emb, dist, y = batch
+        logits = self(emb, dist).squeeze(1)
+        loss = self.loss_fn(logits, y)
+
+        probs = torch.sigmoid(logits)
+        self.val_precision(probs, y.int())
+        self.val_recall(probs, y.int())
+        self.val_f1(probs, y.int())
+
+        n = y.numel()
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=n)
+        self.log("val_precision", self.val_precision, on_epoch=True, batch_size=n)
+        self.log("val_recall", self.val_recall, on_epoch=True, batch_size=n)
+        self.log("val_f1", self.val_f1, on_epoch=True, batch_size=n)
+
+        return loss
+
+    def configure_optimizers(self):
+        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
