@@ -74,7 +74,7 @@ def plot_confusion_matrix(labels, probs, threshold, out_path, title):
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots()
     ConfusionMatrixDisplay(
-        cm, display_labels=["not developed", "converted to developed"]
+        cm, display_labels=["not developed", "developed"]
     ).plot(ax=ax, cmap="Blues", colorbar=False)
     ax.set_title(title)
     fig.savefig(out_path)

@@ -121,8 +121,8 @@ class StratifiedBatchSampler:
     that is not worth it.
     """
 
-    def __init__(self, train_pos, train_neg, batch_size=2048, pos_per_batch=64,
-                 steps_per_epoch=None, seed=0):
+    def __init__(self, train_pos, train_neg, batch_size=2048, 
+                 pos_per_batch=64,steps_per_epoch=None, hard_neg_frac=0.0, seed=0):
         if not 0 < pos_per_batch < batch_size:
             raise ValueError(f"pos_per_batch {pos_per_batch} must be in (0, {batch_size})")
         self.train_pos = train_pos
@@ -130,12 +130,30 @@ class StratifiedBatchSampler:
         self.batch_size = batch_size
         self.pos_per_batch = pos_per_batch
         self.neg_per_batch = batch_size - pos_per_batch
+
+        self.hard_neg_frac = float(hard_neg_frac)
+        self.hard_neg = None
+
         self.seed = seed
         self.steps_per_epoch = (
             steps_per_epoch if steps_per_epoch is not None
             else max(train_pos.size // pos_per_batch, 1)
         )
         self._epoch = 0
+
+    def set_hard_pool(self, hard_neg):
+        """
+        Swaps in the row indices that the miner ranked highest. Set 
+        to None to go back to all uniform negatives. 
+        """
+        self.hard_neg = None if hard_neg is None else np.asarray(hard_neg, dtype=np.int32)
+
+    @property
+    def hard_per_batch(self):
+        if self.hard_neg is None or self.hard_neg.size == 0:
+            return 0
+
+        return int(round(self.hard_neg_frac * self.neg_per_batch))
 
     @property
     def batch_pos_weight(self):
@@ -158,16 +176,24 @@ class StratifiedBatchSampler:
         rng = np.random.default_rng([self.seed, self._epoch])
         self._epoch += 1
 
+        n_hard = self.hard_per_batch
+        n_uniform = self.neg_per_batch - n_hard
+
         pos_order = rng.permutation(self.train_pos.size)
         cursor = 0
         for _ in range(self.steps_per_epoch):
+            # If we have gone through all positives, reshuffle them
             if cursor + self.pos_per_batch > pos_order.size:
                 pos_order = rng.permutation(self.train_pos.size)
                 cursor = 0
             pos = self.train_pos[pos_order[cursor:cursor + self.pos_per_batch]]
             cursor += self.pos_per_batch
 
-            neg = self.train_neg[rng.integers(0, self.train_neg.size, self.neg_per_batch)]
+            # Get the uniform negatives then the hard negatives.
+            neg = self.train_neg[rng.integers(0, self.train_neg.size, n_uniform)]
+            if n_hard:
+                hard = self.hard_neg[rng.integers(0, self.hard_neg.size, n_hard)]
+                neg = np.concat([neg, hard])
 
             batch = np.concatenate([pos, neg])
             rng.shuffle(batch)
@@ -206,7 +232,7 @@ class ArrayDataModule(pl.LightningDataModule):
 
     def __init__(self, arrays, manifest, fold_code, fold_idx, batch_size=2048,
                  pos_per_batch=64, steps_per_epoch=None, val_batch_rows=8192,
-                 train_eval_stride=10, num_workers=0, seed=0):
+                 train_eval_stride=10, hard_neg_frac=0.0, num_workers=0, seed=0):
         super().__init__()
         self.arrays = arrays
         self.manifest = manifest
@@ -217,6 +243,7 @@ class ArrayDataModule(pl.LightningDataModule):
         self.steps_per_epoch = steps_per_epoch
         self.val_batch_rows = val_batch_rows
         self.train_eval_stride = train_eval_stride
+        self.hard_neg_frac = hard_neg_frac
         self.num_workers = num_workers
         self.seed = seed
 
@@ -241,7 +268,7 @@ class ArrayDataModule(pl.LightningDataModule):
         self.train_sampler = StratifiedBatchSampler(
             self.index.train_pos, self.index.train_neg,
             batch_size=self.batch_size, pos_per_batch=self.pos_per_batch,
-            steps_per_epoch=self.steps_per_epoch, seed=self.seed + self.fold_idx,
+            steps_per_epoch=self.steps_per_epoch, hard_neg_frac=self.hard_neg_frac, seed=self.seed + self.fold_idx,
         )
 
         # Scoring the fitted model on its own training blocks needs the natural
@@ -257,6 +284,16 @@ class ArrayDataModule(pl.LightningDataModule):
         """See StratifiedBatchSampler.batch_pos_weight. Unused unless
         train.POS_WEIGHT is set."""
         return self.train_sampler.batch_pos_weight
+
+    def sample_negative_candidates(self, n_candidates, rng):
+        """
+        Get N random negative indices. 
+        """
+        pool = self.index.train_neg
+        n = min(n_candidates, pool.size)
+        take = rng.choice(pool.size, size=n, replace=False)
+        
+        return np.sort(pool[take]).astype(np.int32)
 
     def _loader(self, dataset, sampler):
         return DataLoader(
@@ -284,3 +321,11 @@ class ArrayDataModule(pl.LightningDataModule):
         return self._loader(
             self.gather_ds, SequentialIndexSampler(self.train_eval_idx, self.val_batch_rows)
         )
+
+    def mining_dataloader(self, rows, batch_rows=None):
+        """
+        Sequential scoring pass over chosen rows. This loader is built then
+        thrown away once per mining round. 
+        """
+        sampler = SequentialIndexSampler(rows, batch_rows or self.val_batch_rows)
+        return DataLoader(self.gather_ds, batch_size=None, sampler=sampler)
