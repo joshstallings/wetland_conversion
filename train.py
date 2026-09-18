@@ -26,7 +26,7 @@ from folds import assign_folds, log_fold_stats
 from population_stats import POPULATION_STATS_PATH, load_population_stats
 
 ARRAY_DIR = array_io.ARRAY_DIR
-RESULTS_DIR = Path("results/tcn_2019_2020")
+RESULTS_DIR = Path("results/tcn_2019_2020_hard_negative")
 
 SEED = 0
 N_SPLITS = 5
@@ -68,7 +68,7 @@ TRAIN_EVAL_STRIDE = 10
 NUM_WORKERS = 0
 
 # None disables hard negative mining and reproduces uniform negative sampling (baseline)
-HARD_MINE_EVERY = None
+HARD_MINE_EVERY = 4
 
 # Number of candidates scored per round. 
 HARD_MINE_CANDIDATES = 4e6
@@ -194,8 +194,7 @@ class HardNegativeMiner(pl.Callback):
             f"{r['overlap_with_previous_pool']:.1%} kept from last pool"
         return (
             f"mine round {r['round']} after epoch {r['epochs_done']}: "
-            f"{r['n_candidates']:,} scored in {r['seconds']}s, pool of "
-            f"{r['pool_size']:,} at p >= {r['pool_prob_min']:.4f} "
+            f"pool of {r['pool_size']:,} at p >= {r['pool_prob_min']:.4f} "
             f"(candidate median {r['candidate_prob_quantiles'][0.5]:.4f}), "
             f"{r['pool_n_blocks']} blocks, biggest block "
             f"{r['pool_max_block_share']:.1%}, {churn}"
@@ -294,6 +293,7 @@ def run_fold(fold_idx, data_module, fold_dir):
 
 
 def main():
+    pl.seed_everything(SEED, workers=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Opened once for the whole run, not per fold. populate() is the difference
@@ -316,6 +316,16 @@ def main():
         raise AssertionError(
             f"population_stats.json has {population_stats['total_rows']:,} rows against "
             f"the artifact's {manifest['total_rows']:,}. One of them is stale."
+        )
+    # Row count alone does not pin the horizon: 2019 to 2020 and 2019 to 2024 cover
+    # the same 59,267,331 pixels in the same blocks, so a stats file from the wrong
+    # horizon passes the check above and silently mislabels the run's provenance.
+    # The positive count is the thing that actually differs.
+    if population_stats["total_positive"] != raw_counts[1]:
+        raise AssertionError(
+            f"{POPULATION_STATS_PATH} has {population_stats['total_positive']:,} positives "
+            f"against the artifact's {raw_counts[1]:,}. They are from different label "
+            f"horizons."
         )
 
     fold_assignment = assign_folds(population_stats["block_row_counts"], N_SPLITS, SEED)
@@ -360,7 +370,7 @@ def main():
             arrays, manifest, fold_code, fold_idx,
             batch_size=BATCH_SIZE, pos_per_batch=POS_PER_BATCH,
             steps_per_epoch=STEPS_PER_EPOCH, val_batch_rows=VAL_BATCH_ROWS,
-            train_eval_stride=TRAIN_EVAL_STRIDE, num_workers=NUM_WORKERS, seed=SEED,
+            train_eval_stride=TRAIN_EVAL_STRIDE, hard_neg_frac=HARD_NEG_FRAC, num_workers=NUM_WORKERS, seed=SEED,
         )
         # Called here rather than left to Trainer.fit because pos_weight comes off
         # the batch composition, which is not known until the sampler exists.

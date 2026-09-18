@@ -16,8 +16,8 @@ import pyarrow.dataset as ds
 
 from label_utils import binarize_label
 
-SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined_2019_2024"
-POPULATION_STATS_PATH = "data/wetland_sample_labels_2019_2020.parquet"
+SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined_2019_2020"
+POPULATION_STATS_PATH = "data/population_stats_2019_2020.json"
 
 # (positive, negative) per label horizon. A mismatch means the label
 # binarization is wrong before anything else. Keyed by the horizon suffix of the

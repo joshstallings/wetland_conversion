@@ -291,7 +291,7 @@ class ArrayDataModule(pl.LightningDataModule):
         """
         pool = self.index.train_neg
         n = min(n_candidates, pool.size)
-        take = rng.choice(pool.size, size=n, replace=False)
+        take = rng.choice(int(pool.size), size=int(n), replace=False)
         
         return np.sort(pool[take]).astype(np.int32)
 
