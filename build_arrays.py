@@ -1,6 +1,6 @@
 """
-Converts the joined AlphaEarth + NLCD parquet at data/alphaearth_wetland_joined
-into flat, row addressable .npy arrays under data/arrays, so a map style Dataset
+Converts the joined AlphaEarth + NLCD parquet at data/alphaearth_wetland_joined_2019_2024
+into flat, row addressable .npy arrays under data/arrays_2019_2024, so a map style Dataset
 can index single rows at random instead of streaming whole row groups.
 
 Run once:  python build_arrays.py
@@ -41,8 +41,8 @@ from features import DIST_COL, EMB_COLS, FEATURE_COLS, LABEL_COL
 from label_utils import binarize_label
 from population_stats import POPULATION_STATS_PATH, load_population_stats
 
-SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined"
-ARRAY_DIR = "data/arrays"
+SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined_2019_2024"
+ARRAY_DIR = "data/arrays_2019_2024"
 
 # EMB_COLS is the column order of emb.npy and lives in features.py so the reader
 # side asserts against the same list. Anything that changes FEATURE_COLS

@@ -6,6 +6,7 @@ Reads only label and block_id, skipping the AE embedding cols.
 Run directly (python population_stats.py) to (re)build data/population_stats.json.
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -15,12 +16,16 @@ import pyarrow.dataset as ds
 
 from label_utils import binarize_label
 
-SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined"
-POPULATION_STATS_PATH = "data/population_stats.json"
+SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined_2019_2024"
+POPULATION_STATS_PATH = "data/wetland_sample_labels_2019_2020.parquet"
 
-# A mismatch here means the label binarization is wrong before anything else.
-EXPECTED_TOTAL_POSITIVE = 165_908
-EXPECTED_TOTAL_NEGATIVE = 59_101_423
+# (positive, negative) per label horizon. A mismatch means the label
+# binarization is wrong before anything else. Keyed by the horizon suffix of the
+# source directory, since the same scan now runs over more than one of them.
+EXPECTED_TOTALS = {
+    "2019_2024": (165_908, 59_101_423),
+    "2019_2020": (30_128, 59_237_203),
+}
 
 
 def compute_population_stats(source_parquet_path):
@@ -71,21 +76,34 @@ def load_population_stats(path=POPULATION_STATS_PATH):
 
 
 def main():
-    stats = compute_population_stats(SOURCE_PARQUET_PATH)
-    save_population_stats(stats, POPULATION_STATS_PATH)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--source", default=SOURCE_PARQUET_PATH)
+    ap.add_argument("--out", default=POPULATION_STATS_PATH)
+    args = ap.parse_args()
+
+    stats = compute_population_stats(args.source)
+    save_population_stats(stats, args.out)
 
     print(f"total rows: {stats['total_rows']:,}")
     print(f"total positive (label==1, converted to developed): {stats['total_positive']:,}")
     print(f"total negative (label==0 or 2): {stats['total_negative']:,}")
     print(f"unique blocks: {len(stats['block_row_counts']):,}")
 
-    if (stats["total_positive"], stats["total_negative"]) != (EXPECTED_TOTAL_POSITIVE, EXPECTED_TOTAL_NEGATIVE):
+    horizon = next((h for h in EXPECTED_TOTALS if args.source.endswith(h)), None)
+    if horizon is None:
+        print(f"no expected counts on record for {args.source}, nothing to check against")
+        return
+
+    expected = EXPECTED_TOTALS[horizon]
+    if (stats["total_positive"], stats["total_negative"]) != expected:
         print(
             f"WARNING: counts do not match the expected "
-            f"{EXPECTED_TOTAL_POSITIVE:,} positive / {EXPECTED_TOTAL_NEGATIVE:,} negative "
-            f"from the recipe. Check the label binarization before trusting anything "
-            f"downstream of this file."
+            f"{expected[0]:,} positive / {expected[1]:,} negative "
+            f"for the {horizon} horizon. Check the label binarization before "
+            f"trusting anything downstream of this file."
         )
+    else:
+        print(f"counts match the expected {horizon} totals")
 
 
 if __name__ == "__main__":

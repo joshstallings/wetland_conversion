@@ -26,7 +26,7 @@ from folds import assign_folds, log_fold_stats
 from population_stats import POPULATION_STATS_PATH, load_population_stats
 
 ARRAY_DIR = array_io.ARRAY_DIR
-RESULTS_DIR = Path("results/tcn_hard_neg_mining")
+RESULTS_DIR = Path("results/tcn_2019_2020")
 
 SEED = 0
 N_SPLITS = 5
@@ -42,12 +42,12 @@ GAMMA = 2.0
 # data_module.batch_pos_weight (31) only as a deliberate ablation.
 POS_WEIGHT = None
 
-BATCH_SIZE = 256
+BATCH_SIZE = 2048
 # 64 in 2048 is a 1 in 32 positive rate, against 1 in 356 in the population. This
 # is the number to move first if the model is starved of positives or, in the
 # other direction, if it starts overfitting the 165,908 positives it now sees
 # many times per epoch.
-POS_PER_BATCH = 8
+POS_PER_BATCH = 64
 
 # None means one pass over this fold's train positives per epoch, about 2,100
 # batches. An epoch is a choice now, not a pass over the data.
@@ -68,7 +68,7 @@ TRAIN_EVAL_STRIDE = 10
 NUM_WORKERS = 0
 
 # None disables hard negative mining and reproduces uniform negative sampling (baseline)
-HARD_MINE_EVERY = 4
+HARD_MINE_EVERY = None
 
 # Number of candidates scored per round. 
 HARD_MINE_CANDIDATES = 4e6

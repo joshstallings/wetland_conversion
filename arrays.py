@@ -20,7 +20,7 @@ import numpy as np
 
 from features import EMB_COLS
 
-ARRAY_DIR = "data/arrays"
+ARRAY_DIR = "data/arrays_2019_2020"
 
 # emb.npy is 22.76 GB and has to stay mmapped. The other three are small enough
 # to read straight into RAM (415 MB for all of them), which is strictly better
