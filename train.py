@@ -21,12 +21,19 @@ import arrays as array_io
 import datasets
 import models
 import reporting
-from features import FEATURE_COLS
+from features import YEARS_2017_2022, emb_cols
 from folds import assign_folds, log_fold_stats
-from population_stats import POPULATION_STATS_PATH, load_population_stats
+from population_stats import load_population_stats
 
-ARRAY_DIR = array_io.ARRAY_DIR
-RESULTS_DIR = Path("results/tcn_2019_2020_hard_negative")
+# The three inputs that pin a run's provenance, all named here rather than
+# inherited from a module default, since arrays.ARRAY_DIR still points at the
+# 2019 to 2020 horizon.
+ARRAY_DIR = "data/arrays_2022_2024"
+POPULATION_STATS_PATH = "data/population_stats_2022_2024.json"
+EMB_COLS = emb_cols(YEARS_2017_2022)
+N_YEARS = len(YEARS_2017_2022)
+
+RESULTS_DIR = Path("results/tcn_2022_2024")
 
 SEED = 0
 N_SPLITS = 5
@@ -68,7 +75,7 @@ TRAIN_EVAL_STRIDE = 10
 NUM_WORKERS = 0
 
 # None disables hard negative mining and reproduces uniform negative sampling (baseline)
-HARD_MINE_EVERY = 4
+HARD_MINE_EVERY = None
 
 # Number of candidates scored per round. 
 HARD_MINE_CANDIDATES = 4e6
@@ -207,7 +214,9 @@ def run_fold(fold_idx, data_module, fold_dir):
     index and normalization stats.
     """
     index = data_module.index
-    model = models.TemporalConvolutionalNetwork(lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA)
+    model = models.TemporalConvolutionalNetwork(
+        n_years=N_YEARS, lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA
+    )
 
     fold_dir.mkdir(parents=True, exist_ok=True)
     fold_name = f"fold_{fold_idx}"
@@ -298,7 +307,7 @@ def main():
 
     # Opened once for the whole run, not per fold. populate() is the difference
     # between 0.62 ms and 5.65 ms per batch: see the arrays module docstring.
-    arrays, manifest = array_io.load_arrays(ARRAY_DIR)
+    arrays, manifest = array_io.load_arrays(ARRAY_DIR, emb_columns=EMB_COLS)
     array_io.populate(arrays)
     print(
         f"arrays: {manifest['total_rows']:,} rows, {manifest['n_blocks']} blocks, built "
@@ -317,15 +326,24 @@ def main():
             f"population_stats.json has {population_stats['total_rows']:,} rows against "
             f"the artifact's {manifest['total_rows']:,}. One of them is stale."
         )
-    # Row count alone does not pin the horizon: 2019 to 2020 and 2019 to 2024 cover
-    # the same 59,267,331 pixels in the same blocks, so a stats file from the wrong
+    # Row count alone does not pin the horizon: every joined directory covers the
+    # same 59,267,331 pixels in the same blocks, so a stats file from the wrong
     # horizon passes the check above and silently mislabels the run's provenance.
-    # The positive count is the thing that actually differs.
     if population_stats["total_positive"] != raw_counts[1]:
         raise AssertionError(
             f"{POPULATION_STATS_PATH} has {population_stats['total_positive']:,} positives "
             f"against the artifact's {raw_counts[1]:,}. They are from different label "
             f"horizons."
+        )
+    # The positive count used to be enough. It no longer is: 2019_2024 and
+    # 2022_2024 are the same label on the same pixels, differing only in how many
+    # years of embeddings sit beside it, so both files report 165,908 positives.
+    # The source path is the only thing left that tells them apart.
+    if population_stats["source_parquet_path"] != manifest["source_parquet_path"]:
+        raise AssertionError(
+            f"{POPULATION_STATS_PATH} was scanned from "
+            f"{population_stats['source_parquet_path']} but the arrays were built from "
+            f"{manifest['source_parquet_path']}."
         )
 
     fold_assignment = assign_folds(population_stats["block_row_counts"], N_SPLITS, SEED)

@@ -249,16 +249,34 @@ class MultiLayerPerceptron(pl.LightningModule):
         return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
     
 class TemporalConvolutionalNetwork(pl.LightningModule):
-    def __init__(self, emb_dim=64, hidden_dim=128, dropout=0.3, lr=1e-3, threshold=0.5,
-                 pos_weight=None, gamma=2.0, alpha=None, weight_decay=0.0, kernel_size=2):
+    def __init__(self, emb_dim=64, n_years=3, hidden_dim=128, dropout=0.3, lr=1e-3,
+                 threshold=0.5, pos_weight=None, gamma=2.0, alpha=None, weight_decay=0.0,
+                 kernel_size=2, dilation=None):
         super().__init__()
+
+        # Two kernel 2 convs with no padding give a receptive field of 2 + dilation
+        # and an output length of n_years - 1 - dilation. Setting dilation to
+        # n_years - 2 is the point where the receptive field covers the whole
+        # sequence and the length collapses to 1: the two are mutually exclusive
+        # without padding, so there is nothing to trade off, it is the only
+        # setting that sees all the years. At n_years 3 it works out to 1, which
+        # is what the three year runs were trained with.
+        if dilation is None:
+            dilation = max(1, n_years - 2)
+        if n_years - 1 - dilation < 1:
+            raise ValueError(
+                f"dilation {dilation} leaves no sequence length at n_years {n_years}. "
+                f"The second conv needs n_years - 1 - dilation >= 1."
+            )
+
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
 
-        self.tcn_block = nn.Sequential(nn.Conv1d(emb_dim, hidden_dim, kernel_size=kernel_size), 
+        self.tcn_block = nn.Sequential(nn.Conv1d(emb_dim, hidden_dim, kernel_size=kernel_size),
                                        nn.BatchNorm1d(hidden_dim), nn.ReLU(),
-                                       nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size),
+                                       nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size,
+                                                 dilation=dilation),
                                        nn.BatchNorm1d(hidden_dim), nn.ReLU())
         self.model = nn.Sequential(
             nn.Linear(hidden_dim+1, 256),
@@ -282,10 +300,19 @@ class TemporalConvolutionalNetwork(pl.LightningModule):
         self.val_f1 = BinaryF1Score(threshold=threshold)
 
     def forward(self, emb, dist):
-        # emb is shape (B, 192) need to reshape to (B, 3, 64) and then transpose. 
-        # bc Conv1D takes (channels, length)
+        # emb arrives flat, (B, n_years * emb_dim), laid out year major because
+        # that is the order features.emb_cols generates. Reshape to (B, year, dim)
+        # then transpose, bc Conv1D takes (channels, length).
         emb = emb.float()
-        reshaped_emb = emb.view(-1, 3, self.hparams.emb_dim)
+        n_years, emb_dim = self.hparams.n_years, self.hparams.emb_dim
+        if emb.shape[1] != n_years * emb_dim:
+            # view would happily fold the extra years into the batch dimension and
+            # only blow up later at the cat in the head, so catch it here.
+            raise ValueError(
+                f"emb has {emb.shape[1]} columns against n_years {n_years} times "
+                f"emb_dim {emb_dim}. Pass the n_years the arrays were built with."
+            )
+        reshaped_emb = emb.view(-1, n_years, emb_dim)
         transpose_emb = reshaped_emb.transpose(1, 2)
         tcn_out = self.tcn_block(transpose_emb)
 
