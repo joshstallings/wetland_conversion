@@ -37,17 +37,20 @@ OPTIONAL = ("xy", "rowcol", "label_raw")
 PAGE_BYTES = 4096
 
 
-def load_arrays(array_dir=ARRAY_DIR, optional=()):
+def load_arrays(array_dir=ARRAY_DIR, optional=(), emb_columns=EMB_COLS):
     """
     Opens the artifact. Returns (arrays, manifest).
 
-    arrays maps name to array: emb is a read only mmap of float16 (n, 192), and
-    dist, label, block_code are real in RAM arrays. Anything named in optional
+    arrays maps name to array: emb is a read only mmap of float16 (n, len(emb_columns)),
+    and dist, label, block_code are real in RAM arrays. Anything named in optional
     (see OPTIONAL) is added as an mmap.
 
+    emb_columns defaults to the three year features.EMB_COLS. The six year
+    artifact needs features.emb_cols(features.YEARS_2017_2022) passed here.
+
     Refuses to load if the manifest's embedding column list is not exactly
-    features.EMB_COLS. A .npy carries shape and dtype and nothing else, so if
-    FEATURE_COLS changes and the arrays do not, the only symptom would be a model
+    emb_columns. A .npy carries shape and dtype and nothing else, so if the
+    feature list changes and the arrays do not, the only symptom would be a model
     trained on scrambled columns: no error, no clue. This check is the whole
     reason the column order goes in the manifest.
     """
@@ -55,17 +58,18 @@ def load_arrays(array_dir=ARRAY_DIR, optional=()):
     with open(array_dir / "manifest.json") as fh:
         manifest = json.load(fh)
 
-    stored, expected = manifest["emb_columns"], list(EMB_COLS)
+    stored, expected = manifest["emb_columns"], list(emb_columns)
     if stored != expected:
         first_diff = next(
             (i for i, (a, b) in enumerate(zip(stored, expected)) if a != b),
             min(len(stored), len(expected)),
         )
         raise ValueError(
-            f"{array_dir}/emb.npy was built from a different feature list than "
-            f"features.EMB_COLS ({len(stored)} stored columns against {len(expected)} "
-            f"expected, first difference at position {first_diff}). Every stored column "
-            f"position and every saved row index is wrong. Rebuild with build_arrays.py."
+            f"{array_dir}/emb.npy was built from a different feature list than the one "
+            f"passed in ({len(stored)} stored columns against {len(expected)} expected, "
+            f"first difference at position {first_diff}). Every stored column position "
+            f"and every saved row index is wrong. Either pass the matching emb_columns "
+            f"or rebuild with build_arrays.py."
         )
 
     arrays = {}

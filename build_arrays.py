@@ -1,9 +1,18 @@
 """
-Converts the joined AlphaEarth + NLCD parquet at data/alphaearth_wetland_joined_2019_2024
-into flat, row addressable .npy arrays under data/arrays_2019_2024, so a map style Dataset
-can index single rows at random instead of streaming whole row groups.
+Converts a joined AlphaEarth + NLCD parquet directory into flat, row addressable
+.npy arrays, so a map style Dataset can index single rows at random instead of
+streaming whole row groups.
 
-Run once:  python build_arrays.py
+Run once per source:
+
+    python build_arrays.py
+    python build_arrays.py --source data/alphaearth_wetland_joined_2022_2024 \
+        --out-dir data/arrays_2022_2024 --years 2017_2022 \
+        --population-stats data/population_stats_2022_2024.json
+
+--years has to match what the source parquet holds, since it fixes the column
+order of emb.npy. Getting it wrong is caught at startup by the column count, and
+step 4 would catch a reorder.
 
 Row order contract: files sorted by name, then a stable sort by block_id within
 each file. No block_id spans more than one parquet file (verified live below), so
@@ -37,16 +46,27 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from features import DIST_COL, EMB_COLS, FEATURE_COLS, LABEL_COL
+from features import (
+    DIST_COL,
+    LABEL_COL,
+    YEARS_2017_2019,
+    YEARS_2017_2022,
+    emb_cols,
+    feature_cols,
+)
 from label_utils import binarize_label
 from population_stats import POPULATION_STATS_PATH, load_population_stats
 
 SOURCE_PARQUET_PATH = "data/alphaearth_wetland_joined_2019_2024"
 ARRAY_DIR = "data/arrays_2019_2024"
 
-# EMB_COLS is the column order of emb.npy and lives in features.py so the reader
-# side asserts against the same list. Anything that changes FEATURE_COLS
-# invalidates the artifact, which is why the list goes in the manifest verbatim.
+# Which embedding years the source parquet holds. --years picks one; the
+# resulting column list is the column order of emb.npy and goes in the manifest
+# verbatim, because the reader side asserts against it.
+YEAR_SETS = {
+    "2017_2019": YEARS_2017_2019,
+    "2017_2022": YEARS_2017_2022,
+}
 
 BLOCK_COL = "block_id"
 XY_COLS = ["x", "y"]
@@ -101,7 +121,7 @@ def scan_metadata(source_parquet_path):
     return files, np.asarray(num_rows, dtype=np.int64), offsets, file_meta
 
 
-def open_arrays(out_dir, n_rows, mode, write_label_raw=True):
+def open_arrays(out_dir, n_rows, n_emb, mode, write_label_raw=True):
     """
     Steps 1 and 5's other half. open_memmap rather than np.memmap so the files get
     a real .npy header and np.load(path, mmap_mode="r") recovers shape and dtype
@@ -112,7 +132,7 @@ def open_arrays(out_dir, n_rows, mode, write_label_raw=True):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     spec = {
-        "emb": (np.float16, (n_rows, len(EMB_COLS))),
+        "emb": (np.float16, (n_rows, n_emb)),
         "dist": (np.float32, (n_rows,)),
         "label": (np.uint8, (n_rows,)),
         "block_code": (np.int16, (n_rows,)),
@@ -173,16 +193,16 @@ def _block_codes(table, code_of_block, seen_blocks, file_idx):
     return row_codes, perm
 
 
-def convert(files, offsets, out_dir, write_label_raw=True):
+def convert(files, offsets, out_dir, emb, write_label_raw=True):
     """
     Step 2. One file at a time, written sequentially at its global offset.
 
     Returns (arrays, stats, block_ids_in_write_order).
     """
     n_total = int(offsets[-1])
-    arrays = open_arrays(out_dir, n_total, mode="w+", write_label_raw=write_label_raw)
+    arrays = open_arrays(out_dir, n_total, len(emb), mode="w+", write_label_raw=write_label_raw)
 
-    columns = EMB_COLS + [DIST_COL, LABEL_COL, BLOCK_COL] + XY_COLS + ROWCOL_COLS
+    columns = emb + [DIST_COL, LABEL_COL, BLOCK_COL] + XY_COLS + ROWCOL_COLS
 
     code_of_block, seen_blocks = {}, {}
     raw_class_counts = np.zeros(3, dtype=np.int64)
@@ -205,8 +225,8 @@ def convert(files, offsets, out_dir, write_label_raw=True):
         # Fill (192, n) and transpose on write. Filling an (n, 192) row major array
         # column by column is a strided write and measured 4.1 minutes across the
         # dataset; this way measured 1.8 minutes for the same bytes.
-        tmp = np.empty((len(EMB_COLS), n), dtype=np.float16)
-        for j, name in enumerate(EMB_COLS):
+        tmp = np.empty((len(emb), n), dtype=np.float16)
+        for j, name in enumerate(emb):
             col = table.column(name).to_numpy(zero_copy_only=False)[perm]
             tmp[j] = col
 
@@ -309,7 +329,7 @@ def block_spans(block_code, n_blocks):
 
 
 def write_manifest(out_dir, source_parquet_path, files, file_meta, arrays, stats,
-                   block_ids, starts, counts, write_label_raw):
+                   block_ids, starts, counts, write_label_raw, emb):
     """
     Everything needed to know what these bytes are, since the .npy files carry
     nothing but shape and dtype.
@@ -326,7 +346,7 @@ def write_manifest(out_dir, source_parquet_path, files, file_meta, arrays, stats
             "index into block_ids, which is in write order, not sorted block_id order."
         ),
         "total_rows": int(sum(m["num_rows"] for m in file_meta)),
-        "emb_columns": list(EMB_COLS),
+        "emb_columns": list(emb),
         "dist_column": DIST_COL,
         "xy_columns": list(XY_COLS),
         "rowcol_columns": list(ROWCOL_COLS),
@@ -373,7 +393,7 @@ def write_manifest(out_dir, source_parquet_path, files, file_meta, arrays, stats
     return manifest
 
 
-def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest,
+def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest, emb,
            population_stats_path=POPULATION_STATS_PATH):
     """
     Step 4. All four checks. Checks 1 and 2 assert against population_stats.json
@@ -440,7 +460,7 @@ def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest,
     for i in sample:
         off, n = int(offsets[i]), int(offsets[i + 1] - offsets[i])
         table = pq.read_table(
-            files[i], columns=EMB_COLS + [DIST_COL, LABEL_COL, BLOCK_COL] + ROWCOL_COLS
+            files[i], columns=emb + [DIST_COL, LABEL_COL, BLOCK_COL] + ROWCOL_COLS
         )
         # Deliberately a different code path from the converter: sort the block_id
         # strings directly and look each code up per row, so a bug in the
@@ -471,7 +491,7 @@ def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest,
             e = min(s + 200_000, n)
             got = np.asarray(arrays["emb"][off + s:off + e], dtype=np.float32)
             exp = np.stack(
-                [table.column(c).to_numpy(zero_copy_only=False)[perm[s:e]] for c in EMB_COLS],
+                [table.column(c).to_numpy(zero_copy_only=False)[perm[s:e]] for c in emb],
                 axis=1,
             )
             d = np.abs(got - exp)
@@ -509,14 +529,23 @@ def main():
         action="store_true",
         help="rerun step 4 against arrays already on disk, no conversion",
     )
+    ap.add_argument(
+        "--years",
+        default="2017_2019",
+        choices=sorted(YEAR_SETS),
+        help="which embedding years the source parquet holds. 2017_2022 is the six "
+             "year source, data/alphaearth_wetland_joined_2022_2024",
+    )
     args = ap.parse_args()
 
-    if len(EMB_COLS) != len(FEATURE_COLS) - 1 or DIST_COL in EMB_COLS:
-        raise AssertionError(f"{DIST_COL} is not exactly one column of features.FEATURE_COLS")
+    years = YEAR_SETS[args.years]
+    emb = emb_cols(years)
+    if len(emb) != len(feature_cols(years)) - 1 or DIST_COL in emb:
+        raise AssertionError(f"{DIST_COL} is not exactly one column of features.feature_cols()")
 
     files, num_rows, offsets, file_meta = scan_metadata(args.source)
     pop = load_population_stats(args.population_stats)
-    print(f"{len(files)} files, {int(offsets[-1]):,} rows, {len(EMB_COLS)} embedding columns")
+    print(f"{len(files)} files, {int(offsets[-1]):,} rows, {len(emb)} embedding columns")
     if int(offsets[-1]) != pop["total_rows"]:
         raise AssertionError(
             f"parquet has {int(offsets[-1]):,} rows, population_stats.json says "
@@ -529,24 +558,24 @@ def main():
             manifest = json.load(fh)
         if manifest["file_order"] != [m["name"] for m in file_meta]:
             raise AssertionError("source file list changed since the manifest was written")
-        if manifest["emb_columns"] != list(EMB_COLS):
+        if manifest["emb_columns"] != list(emb):
             raise AssertionError(
-                "features.FEATURE_COLS changed since the arrays were built. The stored "
-                "embedding column order no longer matches, so every saved row index and "
-                "every column position is wrong. Rebuild."
+                f"the --years {args.years} column list does not match the one the arrays "
+                "were built with. The stored embedding column order no longer matches, so "
+                "every saved row index and every column position is wrong. Rebuild."
             )
         arrays = open_arrays(
-            args.out_dir, int(offsets[-1]), mode="r",
+            args.out_dir, int(offsets[-1]), len(emb), mode="r",
             write_label_raw=manifest["label_semantics"]["label_raw_written"],
         )
     else:
         write_label_raw = not args.skip_label_raw
-        arrays, stats, block_ids = convert(files, offsets, args.out_dir, write_label_raw)
+        arrays, stats, block_ids = convert(files, offsets, args.out_dir, emb, write_label_raw)
 
         starts, counts = block_spans(arrays["block_code"], len(block_ids))
         manifest = write_manifest(
             args.out_dir, args.source, files, file_meta, arrays, stats,
-            block_ids, starts, counts, write_label_raw,
+            block_ids, starts, counts, write_label_raw, emb,
         )
 
         raw = stats["raw_class_counts"]
@@ -564,7 +593,7 @@ def main():
         )
         print(f"wrote {len(arrays)} arrays plus manifest.json in {stats['convert_seconds'] / 60:.1f} min\n")
 
-    failures = verify(args.out_dir, args.source, files, offsets, arrays, manifest,
+    failures = verify(args.out_dir, args.source, files, offsets, arrays, manifest, emb,
                       args.population_stats)
     if failures:
         print("\nVERIFICATION FAILED, do not train on these arrays:")

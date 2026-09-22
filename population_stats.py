@@ -25,6 +25,10 @@ POPULATION_STATS_PATH = "data/population_stats_2019_2020.json"
 EXPECTED_TOTALS = {
     "2019_2024": (165_908, 59_101_423),
     "2019_2020": (30_128, 59_237_203),
+    # Same rows and same label as 2019_2024, just three more years of embeddings
+    # alongside them, so the counts have to come out identical. If they do not,
+    # the six year build dropped or reordered rows.
+    "2022_2024": (165_908, 59_101_423),
 }
 
 
