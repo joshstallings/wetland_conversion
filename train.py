@@ -33,7 +33,7 @@ POPULATION_STATS_PATH = "data/population_stats_2022_2024.json"
 EMB_COLS = emb_cols(YEARS_2017_2022)
 N_YEARS = len(YEARS_2017_2022)
 
-RESULTS_DIR = Path("results/tcn_2022_2024")
+RESULTS_DIR = Path("results/tcn_2022_2024_part_2")
 
 SEED = 0
 N_SPLITS = 5

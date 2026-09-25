@@ -2,17 +2,20 @@
 Builds a wetland conversion sample table from two annual NLCD rasters.
 
 Same recipe the original 2019 to 2024 sample used: every pixel NLCD calls
-wetland in 2019 inside Florida, labeled by what that pixel became in the
-target year. Lives in the repo as a script (the notebook that made the
+wetland in the base year inside Florida, labeled by what that pixel became in
+the target year. Lives in the repo as a script (the notebook that made the
 2019 to 2024 file is gone from the tree) so the 2019 to 2020 file has
 provenance.
 
     python build_labels.py 2020
+    python build_labels.py 2024 --base 2022
 
-Writes data/wetland_sample_labels_2019_<target>.parquet
+Writes data/wetland_sample_labels_<base>_<target>.parquet. The base year
+defaults to 2019. Any base year works for the window check below because every
+Annual NLCD year ships on the same CONUS grid.
 """
 
-import sys
+import argparse
 import time
 import urllib.request
 import zipfile
@@ -97,8 +100,7 @@ def distance_to_developed(lc):
     return dist.astype(np.float32)
 
 
-def main(year_target):
-    year_base = 2019
+def main(year_base, year_target):
     path_base, path_target = nlcd_path(year_base), nlcd_path(year_target)
     for p in (path_base, path_target):
         assert p.exists(), f"Missing {p}"
@@ -179,4 +181,9 @@ def main(year_target):
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 2020)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("target", type=int, nargs="?", default=2020)
+    ap.add_argument("--base", type=int, default=2019)
+    args = ap.parse_args()
+    assert args.base < args.target, f"base {args.base} is not before target {args.target}"
+    main(args.base, args.target)
