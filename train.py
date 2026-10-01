@@ -21,28 +21,29 @@ import arrays as array_io
 import datasets
 import models
 import reporting
-from features import YEARS_2017_2022, emb_cols
+from features import YEARS_2017_2019, emb_cols
 from folds import assign_folds, log_fold_stats
 from population_stats import load_population_stats
 
 # The three inputs that pin a run's provenance, all named here rather than
 # inherited from a module default, since arrays.ARRAY_DIR still points at the
 # 2019 to 2020 horizon.
-ARRAY_DIR = "data/arrays_2022_2024"
-POPULATION_STATS_PATH = "data/population_stats_2022_2024.json"
-EMB_COLS = emb_cols(YEARS_2017_2022)
-N_YEARS = len(YEARS_2017_2022)
+ARRAY_DIR = "data/arrays_2019_2024"
+POPULATION_STATS_PATH = "data/population_stats_2019_2024.json"
+EMB_COLS = emb_cols(YEARS_2017_2019)
+N_YEARS = len(YEARS_2017_2019)
 
-RESULTS_DIR = Path("results/tcn_2022_2024_part_2")
+RESULTS_DIR = Path("results/tcn_batch_size_2048_25_epochs")
 
 SEED = 0
-N_SPLITS = 5
+N_SPLITS = 3
 
-MAX_EPOCHS = 15
+MAX_EPOCHS = 25
 LR = 1e-3
 
 # Focal loss is the default. GAMMA=None falls back to nn.BCEWithLogitsLoss.
 GAMMA = 2.0
+ALPHA = None # None to disable Alpha. 
 
 # No pos_weight: focal loss already down weights the easy negatives and
 # POS_PER_BATCH is a second mechanism on the same imbalance. Set this to a fold's
