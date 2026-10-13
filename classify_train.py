@@ -2,10 +2,16 @@
 Training entry point for the array pipeline: 5 fold spatially blocked CV of a
 linear baseline over data/arrays.
 
-Run order from scratch:
-    python population_stats.py    # data/population_stats.json, the independent record
-    python build_arrays.py        # data/arrays, about 10 minutes, verifies itself
-    python train.py
+Run order from scratch for the 2022 to 2024 horizon:
+    python build_labels.py 2024 --base 2022
+    python build_joined_2022_2024.py
+    python population_stats.py --source data/alphaearth_wetland_joined_2022_2024 \
+        --out data/population_stats_2022_2024.json
+    python build_arrays.py --source data/alphaearth_wetland_joined_2022_2024 \
+        --out-dir data/arrays_2022_2024 --years 2017_2022 \
+        --population-stats data/population_stats_2022_2024.json \
+        --dist-col dist_to_developed_2022_m
+    python classify_train.py
 """
 
 import json
@@ -21,24 +27,26 @@ import arrays as array_io
 import datasets
 import models
 import reporting
-from features import YEARS_2017_2019, emb_cols
+from features import YEARS_2017_2022, emb_cols
 from folds import assign_folds, log_fold_stats
 from population_stats import load_population_stats
 
 # The three inputs that pin a run's provenance, all named here rather than
 # inherited from a module default, since arrays.ARRAY_DIR still points at the
 # 2019 to 2020 horizon.
-ARRAY_DIR = "data/arrays_2019_2024"
-POPULATION_STATS_PATH = "data/population_stats_2019_2024.json"
-EMB_COLS = emb_cols(YEARS_2017_2019)
-N_YEARS = len(YEARS_2017_2019)
+# Wetland in both 2019 and 2022, labeled by 2024, embeddings 2017 to 2022. Swap
+# back to arrays_2019_2024 and YEARS_2017_2019 for the 2019 base year run.
+ARRAY_DIR = "data/arrays_2022_2024"
+POPULATION_STATS_PATH = "data/population_stats_2022_2024.json"
+EMB_COLS = emb_cols(YEARS_2017_2022)
+N_YEARS = len(YEARS_2017_2022)
 
-RESULTS_DIR = Path("results/tcn_batch_size_2048_25_epochs")
+RESULTS_DIR = Path("results/tcn_2022_2024_batch_size_2048")
 
 SEED = 0
 N_SPLITS = 3
 
-MAX_EPOCHS = 25
+MAX_EPOCHS = 15
 LR = 1e-3
 
 # Focal loss is the default. GAMMA=None falls back to nn.BCEWithLogitsLoss.
@@ -51,14 +59,14 @@ ALPHA = None # None to disable Alpha.
 POS_WEIGHT = None
 
 BATCH_SIZE = 2048
-# 64 in 2048 is a 1 in 32 positive rate, against 1 in 356 in the population. This
-# is the number to move first if the model is starved of positives or, in the
-# other direction, if it starts overfitting the 165,908 positives it now sees
-# many times per epoch.
+# 64 in 2048 is a 1 in 32 positive rate, against 1 in 904 in the 2022_2024
+# population (1 in 356 for 2019_2024). This is the number to move first if the
+# model is starved of positives or, in the other direction, if it starts
+# overfitting the 65,245 positives it now sees many times per epoch.
 POS_PER_BATCH = 64
 
-# None means one pass over this fold's train positives per epoch, about 2,100
-# batches. An epoch is a choice now, not a pass over the data.
+# None means one pass over this fold's train positives per epoch, about 680
+# batches on 2022_2024. An epoch is a choice now, not a pass over the data.
 STEPS_PER_EPOCH = None
 
 # Val is a sequential sweep over contiguous block spans, so a bigger read is
@@ -336,10 +344,8 @@ def main():
             f"against the artifact's {raw_counts[1]:,}. They are from different label "
             f"horizons."
         )
-    # The positive count used to be enough. It no longer is: 2019_2024 and
-    # 2022_2024 are the same label on the same pixels, differing only in how many
-    # years of embeddings sit beside it, so both files report 165,908 positives.
-    # The source path is the only thing left that tells them apart.
+    # Belt and braces on top of the positive count: a stats file scanned from a
+    # different parquet directory is the wrong record even if the counts agree.
     if population_stats["source_parquet_path"] != manifest["source_parquet_path"]:
         raise AssertionError(
             f"{POPULATION_STATS_PATH} was scanned from "
@@ -376,6 +382,8 @@ def main():
             "total_rows": manifest["total_rows"],
             "n_blocks": manifest["n_blocks"],
             "raw_class_counts": raw_counts,
+            "emb_columns_first_last": [manifest["emb_columns"][0], manifest["emb_columns"][-1]],
+            "dist_column": manifest["dist_column"],
             "emb_dtype": manifest["arrays"]["emb"]["dtype"],
             "float16_cast": manifest["float16_cast"],
         },

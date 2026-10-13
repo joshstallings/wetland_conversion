@@ -3,15 +3,18 @@ Feature and label column names for the joined AlphaEarth + NLCD parquets under
 data/.
 
 A00..A63 for each year are the AlphaEarth embedding dims for the years leading
-up to the label snapshot. dist_to_developed_2019_m is the one non embedding
-feature and is on a meters scale, not unit scaled like the embedding dims, so it
-needs its own normalization pass wherever it's used.
+up to the label snapshot. The distance to developed in the base year is the one
+non embedding feature and is on a meters scale, not unit scaled like the
+embedding dims, so it needs its own normalization pass wherever it's used.
+DIST_COL is the 2019 one; the 2022_2024 arrays use dist_to_developed_2022_m,
+and the manifest's dist_column says which one dist.npy holds.
 
 Two column sets are in play. YEARS_2017_2019 is what
 data/alphaearth_wetland_joined_2019_2024 and _2019_2020 hold, and stays the
 module default so nothing already built has to change. YEARS_2017_2022 is the
-six year set in data/alphaearth_wetland_joined_2022_2024. Same rows, same label,
-three more years of embeddings.
+six year set in data/alphaearth_wetland_joined_2022_2024, which is a different
+population: wetland in both 2019 and 2022, labeled by 2024
+(build_joined_2022_2024.py).
 """
 
 YEARS_2017_2019 = (2017, 2018, 2019)

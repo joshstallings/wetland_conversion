@@ -8,7 +8,8 @@ Run once per source:
     python build_arrays.py
     python build_arrays.py --source data/alphaearth_wetland_joined_2022_2024 \
         --out-dir data/arrays_2022_2024 --years 2017_2022 \
-        --population-stats data/population_stats_2022_2024.json
+        --population-stats data/population_stats_2022_2024.json \
+        --dist-col dist_to_developed_2022_m
 
 --years has to match what the source parquet holds, since it fixes the column
 order of emb.npy. Getting it wrong is caught at startup by the column count, and
@@ -193,7 +194,7 @@ def _block_codes(table, code_of_block, seen_blocks, file_idx):
     return row_codes, perm
 
 
-def convert(files, offsets, out_dir, emb, write_label_raw=True):
+def convert(files, offsets, out_dir, emb, write_label_raw=True, dist_col=DIST_COL):
     """
     Step 2. One file at a time, written sequentially at its global offset.
 
@@ -202,7 +203,7 @@ def convert(files, offsets, out_dir, emb, write_label_raw=True):
     n_total = int(offsets[-1])
     arrays = open_arrays(out_dir, n_total, len(emb), mode="w+", write_label_raw=write_label_raw)
 
-    columns = emb + [DIST_COL, LABEL_COL, BLOCK_COL] + XY_COLS + ROWCOL_COLS
+    columns = emb + [dist_col, LABEL_COL, BLOCK_COL] + XY_COLS + ROWCOL_COLS
 
     code_of_block, seen_blocks = {}, {}
     raw_class_counts = np.zeros(3, dtype=np.int64)
@@ -235,7 +236,7 @@ def convert(files, offsets, out_dir, emb, write_label_raw=True):
             if sub.size:
                 max_roundtrip_err = max(max_roundtrip_err, float(sub.max()))
 
-        dist = table.column(DIST_COL).to_numpy(zero_copy_only=False)[perm]
+        dist = table.column(dist_col).to_numpy(zero_copy_only=False)[perm]
         raw_label = table.column(LABEL_COL).to_numpy(zero_copy_only=False)[perm]
 
         # Counts before binarizing. Once 2 is folded into 0 the artifact can no
@@ -329,7 +330,7 @@ def block_spans(block_code, n_blocks):
 
 
 def write_manifest(out_dir, source_parquet_path, files, file_meta, arrays, stats,
-                   block_ids, starts, counts, write_label_raw, emb):
+                   block_ids, starts, counts, write_label_raw, emb, dist_col=DIST_COL):
     """
     Everything needed to know what these bytes are, since the .npy files carry
     nothing but shape and dtype.
@@ -347,7 +348,7 @@ def write_manifest(out_dir, source_parquet_path, files, file_meta, arrays, stats
         ),
         "total_rows": int(sum(m["num_rows"] for m in file_meta)),
         "emb_columns": list(emb),
-        "dist_column": DIST_COL,
+        "dist_column": dist_col,
         "xy_columns": list(XY_COLS),
         "rowcol_columns": list(ROWCOL_COLS),
         "arrays": {
@@ -394,7 +395,7 @@ def write_manifest(out_dir, source_parquet_path, files, file_meta, arrays, stats
 
 
 def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest, emb,
-           population_stats_path=POPULATION_STATS_PATH):
+           population_stats_path=POPULATION_STATS_PATH, dist_col=DIST_COL):
     """
     Step 4. All four checks. Checks 1 and 2 assert against population_stats.json
     rather than literals, because that file was produced by an independent scan of
@@ -460,7 +461,7 @@ def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest, emb,
     for i in sample:
         off, n = int(offsets[i]), int(offsets[i + 1] - offsets[i])
         table = pq.read_table(
-            files[i], columns=emb + [DIST_COL, LABEL_COL, BLOCK_COL] + ROWCOL_COLS
+            files[i], columns=emb + [dist_col, LABEL_COL, BLOCK_COL] + ROWCOL_COLS
         )
         # Deliberately a different code path from the converter: sort the block_id
         # strings directly and look each code up per row, so a bug in the
@@ -468,7 +469,7 @@ def verify(out_dir, source_parquet_path, files, offsets, arrays, manifest, emb,
         bid = table.column(BLOCK_COL).to_numpy(zero_copy_only=False)
         perm = np.argsort(bid, kind="stable")
         exp_code = np.array([code_of_block[b] for b in bid[perm]], dtype=np.int16)
-        exp_dist = table.column(DIST_COL).to_numpy(zero_copy_only=False)[perm]
+        exp_dist = table.column(dist_col).to_numpy(zero_copy_only=False)[perm]
         exp_label = binarize_label(table.column(LABEL_COL).to_numpy(zero_copy_only=False)[perm])
         exp_rowcol = np.stack(
             [table.column(c).to_numpy(zero_copy_only=False)[perm] for c in ROWCOL_COLS], axis=1
@@ -530,6 +531,13 @@ def main():
         help="rerun step 4 against arrays already on disk, no conversion",
     )
     ap.add_argument(
+        "--dist-col",
+        default=DIST_COL,
+        help="the one meters scale column written to dist.npy. Should be the distance "
+             "to developed in the label's base year, so dist_to_developed_2022_m for "
+             "the 2022_2024 source",
+    )
+    ap.add_argument(
         "--years",
         default="2017_2019",
         choices=sorted(YEAR_SETS),
@@ -540,8 +548,8 @@ def main():
 
     years = YEAR_SETS[args.years]
     emb = emb_cols(years)
-    if len(emb) != len(feature_cols(years)) - 1 or DIST_COL in emb:
-        raise AssertionError(f"{DIST_COL} is not exactly one column of features.feature_cols()")
+    if len(emb) != len(feature_cols(years)) - 1 or args.dist_col in emb:
+        raise AssertionError(f"{args.dist_col} is not exactly one column outside the embeddings")
 
     files, num_rows, offsets, file_meta = scan_metadata(args.source)
     pop = load_population_stats(args.population_stats)
@@ -564,18 +572,25 @@ def main():
                 "were built with. The stored embedding column order no longer matches, so "
                 "every saved row index and every column position is wrong. Rebuild."
             )
+        if manifest["dist_column"] != args.dist_col:
+            raise AssertionError(
+                f"the arrays were built with dist.npy from {manifest['dist_column']}, "
+                f"not {args.dist_col}"
+            )
         arrays = open_arrays(
             args.out_dir, int(offsets[-1]), len(emb), mode="r",
             write_label_raw=manifest["label_semantics"]["label_raw_written"],
         )
     else:
         write_label_raw = not args.skip_label_raw
-        arrays, stats, block_ids = convert(files, offsets, args.out_dir, emb, write_label_raw)
+        arrays, stats, block_ids = convert(
+            files, offsets, args.out_dir, emb, write_label_raw, args.dist_col
+        )
 
         starts, counts = block_spans(arrays["block_code"], len(block_ids))
         manifest = write_manifest(
             args.out_dir, args.source, files, file_meta, arrays, stats,
-            block_ids, starts, counts, write_label_raw, emb,
+            block_ids, starts, counts, write_label_raw, emb, args.dist_col,
         )
 
         raw = stats["raw_class_counts"]
@@ -594,7 +609,7 @@ def main():
         print(f"wrote {len(arrays)} arrays plus manifest.json in {stats['convert_seconds'] / 60:.1f} min\n")
 
     failures = verify(args.out_dir, args.source, files, offsets, arrays, manifest, emb,
-                      args.population_stats)
+                      args.population_stats, manifest["dist_column"])
     if failures:
         print("\nVERIFICATION FAILED, do not train on these arrays:")
         for f in failures:

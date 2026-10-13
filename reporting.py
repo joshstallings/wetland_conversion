@@ -51,7 +51,7 @@ def get_val_predictions(model, dataloader):
     return torch.cat(all_probs).numpy(), torch.cat(all_labels).numpy()
 
 
-def plot_loss_curve(metrics_csv_path, out_path, title):
+def plot_loss_curve(metrics_csv_path, out_path, title, ylabel="Focal loss"):
     """metrics_csv_path: the metrics.csv written by pytorch_lightning's CSVLogger."""
     df = pd.read_csv(metrics_csv_path)
     fig, ax = plt.subplots()
@@ -62,7 +62,7 @@ def plot_loss_curve(metrics_csv_path, out_path, title):
         val_df = df.dropna(subset=["val_loss"])
         ax.plot(val_df["epoch"], val_df["val_loss"], label="val loss")
     ax.set_xlabel("epoch")
-    ax.set_ylabel("Focal loss")
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend()
     fig.savefig(out_path)
@@ -341,7 +341,7 @@ def plot_precision_at_recall_vs_ratio(rows, recall_target, out_path, title):
     plt.close(fig)
 
 
-def plot_mean_pr_curve(fold_preds, out_path, title, n_recall_points=201):
+def plot_mean_pr_curve(fold_preds, out_path, title, n_recall_points=201, chance_unit="pixels"):
     """Mean train and val precision recall curve across folds, with a plus or
     minus one standard deviation ribbon.
 
@@ -388,7 +388,7 @@ def plot_mean_pr_curve(fold_preds, out_path, title, n_recall_points=201):
     # it an AUPRC of 0.09 reads as terrible rather than as 30x chance.
     chance = float(np.mean(positive_rates))
     ax.axhline(chance, color="#666666", linewidth=1, linestyle=":",
-               label=f"chance, {chance:.3%} of pixels converted")
+               label=f"chance, {chance:.3%} of {chance_unit} converted")
 
     ax.set_xlabel("recall", fontsize=13)
     ax.set_ylabel("precision (band is plus or minus 1 std across folds)", fontsize=12)
@@ -399,3 +399,282 @@ def plot_mean_pr_curve(fold_preds, out_path, title, n_recall_points=201):
     ax.legend(fontsize=12, frameon=False)
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
+
+
+# Regression side, for the cell task in regress_train.py. Predictions there are a
+# share of the cell's 2019 wetland developed by 2024, not a probability, so the
+# threshold metrics above do not apply. "Any conversion" (target > 0) is the
+# binary view used wherever a PR curve or AUPRC shows up.
+
+WEIGHTED_COLOR = "#009E73"
+REFERENCE_COLOR = "#666666"
+
+
+def get_cell_predictions(model, dataloader):
+    """Runs a CellTemporalConvolutionalNetwork over dataloader once, no grad.
+    Returns (pred, target, n_wetland) as numpy arrays, in loader order. Batches
+    are the 5 tuples datasets.CellDataModule yields. Same device caveat as
+    get_val_predictions."""
+    model.eval()
+    device = next(model.parameters()).device
+    preds, targets, n_wets = [], [], []
+    with torch.no_grad():
+        for emb_mean, emb_std, scalars, y, n_wetland in dataloader:
+            pred = model(emb_mean.to(device), emb_std.to(device), scalars.to(device))
+            preds.append(pred.cpu())
+            targets.append(y)
+            n_wets.append(n_wetland)
+    return torch.cat(preds).numpy(), torch.cat(targets).numpy(), torch.cat(n_wets).numpy()
+
+
+def score_cells(pred, target, n_wetland):
+    """
+    Everything a regression fold gets judged on. Unweighted metrics count every
+    cell once; weighted ones count every wetland pixel once.
+
+    zero_mse and zero_mae are what predicting 0 for every cell would score. With
+    about 97% of 300 m cells at exactly 0, MSE and MAE look small for any model,
+    so they only mean something next to this baseline.
+    """
+    pred = pred.astype(np.float64)
+    target = target.astype(np.float64)
+    w = n_wetland.astype(np.float64)
+    err = pred - target
+    any_dev = target > 0
+    mse = float(np.mean(err ** 2))
+    # Clipped because pred comes in as a float32 probability, which rounds to
+    # exactly 0 or 1 once the logit is far enough out. Binomial log likelihood per
+    # pixel, so it lines up with val_log_loss_weighted in training.
+    p = np.clip(pred, 1e-7, 1 - 1e-7)
+    log_loss = -(target * np.log(p) + (1 - target) * np.log(1 - p))
+    return {
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "mse_weighted": float(np.average(err ** 2, weights=w)),
+        "log_loss_weighted": float(np.average(log_loss, weights=w)),
+        "mae": float(np.mean(np.abs(err))),
+        "mae_weighted": float(np.average(np.abs(err), weights=w)),
+        "zero_mse": float(np.mean(target ** 2)),
+        "zero_mae": float(np.mean(target)),
+        "auprc": float(average_precision_score(any_dev, pred)) if any_dev.any() else float("nan"),
+        "positive_rate": float(any_dev.mean()),
+        "pred_over_actual": float((pred * w).sum() / max((target * w).sum(), 1.0)),
+        "mean_pred": float(pred.mean()),
+        "mean_target": float(target.mean()),
+        "n_cells": int(target.size),
+    }
+
+
+def write_regression_summary(rows, out_path):
+    """One row per fold plus the mean and std across folds, printed. The CSV keeps
+    every column score_cells and the training script put in."""
+    df = pd.DataFrame(rows)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+
+    base = ["mse", "zero_mse", "mse_weighted", "log_loss_weighted", "mae", "zero_mae",
+            "mae_weighted", "auprc", "positive_rate", "pred_over_actual"]
+    cols = [c for c in base + [f"train_{c}" for c in base] if c in df.columns]
+    with pd.option_context("display.width", 200, "display.max_columns", 50):
+        print(df[["fold"] + cols])
+        print("\nmean, std across folds:")
+        print(df[cols].agg(["mean", "std"]))
+    return df
+
+
+def _stack_epochs(metrics_csv_paths, col):
+    """(epochs, stacked) for one logged column across folds, stacked shaped
+    (n_folds, n_epochs) and truncated to the shortest fold. (None, None) if no
+    fold logged it."""
+    series = []
+    for path in metrics_csv_paths:
+        df = pd.read_csv(path)
+        if col in df.columns:
+            s = df.dropna(subset=[col]).groupby("epoch")[col].mean().sort_index()
+            if not s.empty:
+                series.append(s)
+    if not series:
+        return None, None
+    n = min(len(s) for s in series)
+    return series[0].index.to_numpy()[:n], np.vstack([s.to_numpy()[:n] for s in series])
+
+
+def _plot_band(ax, epochs, stacked, color, label, linestyle="-"):
+    mean, std = _mean_std(stacked)
+    if stacked.shape[0] > 1:
+        label = f"{label}, mean of {stacked.shape[0]} folds"
+        ax.fill_between(epochs, mean - std, mean + std, color=color, alpha=0.2, linewidth=0)
+    ax.plot(epochs, mean, color=color, linewidth=2, linestyle=linestyle, label=label)
+
+
+def plot_cell_val_metrics(metrics_csv_paths, out_path, title_suffix=""):
+    """
+    Validation MAE, AUPRC on any conversion, and predicted over actual converted
+    pixels, per epoch. One metrics.csv gives a single fold's curves; several give
+    the fold mean with a plus or minus one std band.
+
+    AUPRC is drawn against the share of val cells with any conversion, which is
+    what a random ranking scores. Predicted over actual gets a line at 1, where
+    the model's total converted area matches the real one.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=150)
+
+    ax = axes[0]
+    for col, color, label in (("val_mae", VAL_COLOR, "every cell counts once"),
+                              ("val_mae_weighted", WEIGHTED_COLOR, "weighted by wetland pixels")):
+        epochs, stacked = _stack_epochs(metrics_csv_paths, col)
+        if stacked is not None:
+            _plot_band(ax, epochs, stacked, color, label)
+    ax.set_ylabel("Mean absolute error (fraction of wetland)", fontsize=12)
+    ax.set_title(f"Validation MAE{title_suffix}", fontsize=14)
+
+    ax = axes[1]
+    epochs, stacked = _stack_epochs(metrics_csv_paths, "val_auprc")
+    if stacked is not None:
+        _plot_band(ax, epochs, stacked, VAL_COLOR, "validation AUPRC")
+    epochs, rate = _stack_epochs(metrics_csv_paths, "val_pos_rate")
+    if rate is not None:
+        ax.axhline(float(rate.mean()), color=REFERENCE_COLOR, linestyle=":", linewidth=1.5,
+                   label=f"chance, {rate.mean():.2%} of cells with any conversion")
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("AUPRC, any conversion in the cell", fontsize=12)
+    ax.set_title(f"Validation AUPRC{title_suffix}", fontsize=14)
+
+    ax = axes[2]
+    epochs, stacked = _stack_epochs(metrics_csv_paths, "val_pred_over_actual")
+    if stacked is not None:
+        _plot_band(ax, epochs, stacked, VAL_COLOR, "validation")
+    ax.axhline(1.0, color=REFERENCE_COLOR, linestyle=":", linewidth=1.5,
+               label="predicted total equals actual")
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("Predicted over actual converted pixels", fontsize=12)
+    ax.set_title(f"Total converted area{title_suffix}", fontsize=14)
+
+    for ax in axes:
+        ax.set_xlabel("Epoch", fontsize=13)
+        ax.tick_params(labelsize=11)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(fontsize=11, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+# Outcome classes for the per bin mix columns in the calibration CSV.
+OUTCOME_BINS = (
+    ("no conversion", None),
+    ("under 10%", (0.0, 0.10)),
+    ("10 to 50%", (0.10, 0.50)),
+    ("50 to 100%", (0.50, 1.0)),
+)
+
+
+def plot_cell_calibration(pred, target, out_path, ratio_out_path, title, ratio_title, n_bins=20,
+                          label="validation", color=VAL_COLOR):
+    """
+    Cells sorted by predicted share into n_bins equal count bins, two figures.
+
+    out_path: mean actual against mean predicted per bin, both axes log. On linear
+    axes almost every bin sits under 1% predicted and collapses into the corner,
+    so the top bin alone decides how the plot looks; on log axes a bin that is
+    off by 10x is visibly off by 10x however small its values are.
+    ratio_out_path: mean actual over mean predicted per bin, with a line at 1.
+    Above the line the model underpredicts that bin.
+
+    Bin means hide the mix inside a bin (mostly zeros plus a few cells that lost
+    everything), so the CSV keeps the share of each bin in each OUTCOME_BINS class.
+
+    Predictions saturate at the sigmoid's floor for many cells, so bin means are
+    floored at 1e-10 percent before the log. Returns the per bin table, which is
+    also what goes in the CSV next to the PNGs.
+    """
+    order = np.argsort(pred, kind="stable")
+    bins = np.array_split(order, n_bins)
+    rows = []
+    for i, b in enumerate(bins):
+        t, p = target[b], pred[b]
+        row = {
+            "bin": i + 1,
+            "n_cells": b.size,
+            "mean_pred_pct": 100 * float(p.mean()),
+            "mean_actual_pct": 100 * float(t.mean()),
+            "actual_p90_pct": 100 * float(np.percentile(t, 90)),
+        }
+        for name, rng in OUTCOME_BINS:
+            m = (t == 0) if rng is None else ((t > rng[0]) & (t <= rng[1]))
+            row[f"share_{name.replace(' ', '_').replace('%', 'pct')}"] = float(m.mean())
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    floor = 1e-10
+    mp = table["mean_pred_pct"].clip(lower=floor)
+    ma = table["mean_actual_pct"].clip(lower=floor)
+    table["actual_over_pred"] = ma / mp
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=150)
+    lo = min(mp.min(), ma.min()) / 3
+    hi = max(mp.max(), ma.max()) * 3
+    ax.plot([lo, hi], [lo, hi], color=REFERENCE_COLOR, linestyle=":", linewidth=1.5,
+            label="prediction matches actual")
+    ax.plot(mp, ma, "o-", color=color, linewidth=2, markersize=6,
+            label=f"{label}, {n_bins} bins of {len(pred) // n_bins:,} cells")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("Mean predicted share converted (percent, log)", fontsize=12)
+    ax.set_ylabel("Mean actual share converted (percent, log)", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.legend(fontsize=11, frameon=False, loc="upper left")
+    ax.tick_params(labelsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+    x = table["bin"].to_numpy()
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=150)
+    ax.axhline(1.0, color=REFERENCE_COLOR, linestyle=":", linewidth=1.5, label="prediction matches actual")
+    ax.plot(x, table["actual_over_pred"], "o-", color=color, linewidth=2, markersize=6,
+            label=f"{label}, actual over predicted")
+    ax.set_yscale("log")
+    ax.set_xticks(x[::2] if len(x) > 10 else x)
+    ax.set_xlabel("Prediction bin, lowest to highest", fontsize=12)
+    ax.set_ylabel("Mean actual over mean predicted (log)", fontsize=12)
+    ax.set_title(ratio_title, fontsize=14)
+    ax.legend(fontsize=11, frameon=False)
+    ax.tick_params(labelsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(ratio_out_path, bbox_inches="tight")
+    plt.close(fig)
+    return table
+
+
+def write_train_calibration_pooled(fold_dirs, results_dir):
+    """
+    Calibration of each fold's final model on its own training cells, pooled
+    over folds, from the train_preds.npz every fold writes. Writes
+    training_calibration_pooled.png, its _ratio.png and .csv into results_dir.
+
+    Unlike the val pool, this does not score each cell once. A cell sits in the
+    train set of every fold but its own, so with 5 folds it shows up 4 times,
+    scored by 4 different models. Read it as the average in sample fit of the
+    fold models, next to calibration_pooled.png for the out of sample one.
+    """
+    preds, targets = [], []
+    for d in fold_dirs:
+        tr = np.load(Path(d) / "train_preds.npz")
+        preds.append(tr["pred"])
+        targets.append(tr["target"])
+    results_dir = Path(results_dir)
+    table = plot_cell_calibration(
+        np.concatenate(preds), np.concatenate(targets),
+        results_dir / "training_calibration_pooled.png",
+        results_dir / "training_calibration_pooled_ratio.png",
+        "Predicted against actual share converted, training cells, all folds",
+        "Actual over predicted share converted by bin, training cells, all folds",
+        label="training", color=TRAIN_COLOR,
+    )
+    table.to_csv(results_dir / "training_calibration_pooled.csv", index=False)
+    return table

@@ -25,9 +25,9 @@ POPULATION_STATS_PATH = "data/population_stats_2019_2020.json"
 EXPECTED_TOTALS = {
     "2019_2024": (165_908, 59_101_423),
     "2019_2020": (30_128, 59_237_203),
-    # Wetland in both 2019 and 2022, labeled by 2024. Built by rebase_arrays.py and
-    # rebase_manifest.py from the arrays, since the joined parquet for this horizon
-    # is gone. Before the rebase this entry held the 2019_2024 counts.
+    # Wetland in both 2019 and 2022, labeled by 2024, from build_joined_2022_2024.py.
+    # First built by an uncommitted rebase_arrays.py; the rebuild has to land on the
+    # same counts.
     "2022_2024": (65_245, 58_931_894),
 }
 

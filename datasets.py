@@ -5,6 +5,9 @@ parquet.
 
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -329,3 +332,170 @@ class ArrayDataModule(pl.LightningDataModule):
         """
         sampler = SequentialIndexSampler(rows, batch_rows or self.val_batch_rows)
         return DataLoader(self.gather_ds, batch_size=None, sampler=sampler)
+
+
+CELL_DIR = "data/cells_2019_2024_300m"
+CELL_SCALARS = ("log1p_dist_mean", "log1p_dist_min", "log1p_n_wetland")
+
+
+def load_cells(cell_dir=CELL_DIR):
+    """
+    Reads a build_cells.py output into RAM. Returns (cells, manifest).
+
+    Everything is loaded resident, not mmapped. At 300 m the two embedding arrays
+    are 0.9 GB each; at 90 m they are 6.6 GB each, which still fits on this
+    machine but is the size to watch if cells get smaller.
+    """
+    cell_dir = Path(cell_dir)
+    with open(cell_dir / "manifest.json") as fh:
+        manifest = json.load(fh)
+    names = ("emb_mean", "emb_std", "target", "n_wetland", "n_developed",
+             "dist_mean", "dist_min", "block_code", "footprint_px")
+    cells = {k: np.load(cell_dir / f"{k}.npy") for k in names}
+
+    n = manifest["stats"]["n_cells"]
+    for k, a in cells.items():
+        if a.shape[0] != n:
+            raise ValueError(f"{k}.npy has {a.shape[0]:,} rows, manifest says {n:,}")
+    return cells, manifest
+
+
+class CellDataset:
+    """
+    Random access cells by index array, same batch at a time convention as
+    GatherDataset. Returns (emb_mean (B, 192), emb_std (B, 192), scalars (B, 3),
+    target (B,), n_wetland (B,)), all float32 except n_wetland, which stays int32
+    so the model can choose whether to weight by it.
+    """
+
+    def __init__(self, cells, scalars):
+        self.emb_mean = cells["emb_mean"]
+        self.emb_std = cells["emb_std"]
+        self.target = cells["target"]
+        self.n_wetland = cells["n_wetland"]
+        self.scalars = scalars
+
+    def __len__(self):
+        return self.target.shape[0]
+
+    def __getitem__(self, idx):
+        return (torch.from_numpy(self.emb_mean[idx]), torch.from_numpy(self.emb_std[idx]),
+                torch.from_numpy(self.scalars[idx]), torch.from_numpy(self.target[idx]),
+                torch.from_numpy(self.n_wetland[idx]))
+
+
+class ShuffledIndexSampler:
+    """
+    One pass over row_idx per epoch in a fresh order, batch_size at a time.
+    Seeded off (seed, epoch) like StratifiedBatchSampler so a run reproduces from
+    its seed. No stratification: about 3% of 300 m cells have any conversion, so a
+    1,024 cell batch carries about 30 positives at the natural rate already.
+    """
+
+    def __init__(self, row_idx, batch_size, seed=0):
+        self.row_idx = np.asarray(row_idx, dtype=np.int64)
+        self.batch_size = batch_size
+        self.seed = seed
+        self._epoch = 0
+
+    def __len__(self):
+        return (self.row_idx.size + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        rng = np.random.default_rng([self.seed, self._epoch])
+        self._epoch += 1
+        order = self.row_idx[rng.permutation(self.row_idx.size)]
+        for start in range(0, order.size, self.batch_size):
+            # Sorted within the batch so the fancy index walks memory forward.
+            yield np.sort(order[start:start + self.batch_size])
+
+
+class CellDataModule(pl.LightningDataModule):
+    """
+    One fold's loaders over a cell artifact from build_cells.py.
+
+    fold_code is the same per block array ArrayDataModule takes
+    (arrays.fold_of_code), so cell folds are the pixel folds: a cell inherits the
+    fold of the 10 km block it sits in, and build_cells.py never lets a cell cross
+    a block edge.
+
+    min_wetland_train drops tiny cells from training only. Val always keeps every
+    cell in the fold, so val numbers describe the real population and do not move
+    when this knob does.
+    """
+
+    def __init__(self, cells, manifest, fold_code, fold_idx, batch_size=1024,
+                 val_batch_size=8192, min_wetland_train=1, num_workers=0, seed=0):
+        super().__init__()
+        self.cells = cells
+        self.manifest = manifest
+        self.fold_code = np.asarray(fold_code)
+        self.fold_idx = fold_idx
+        self.batch_size = batch_size
+        self.val_batch_size = val_batch_size
+        self.min_wetland_train = min_wetland_train
+        self.num_workers = num_workers
+        self.seed = seed
+
+    def setup(self, stage=None):
+        if getattr(self, "train_idx", None) is not None:
+            return
+
+        c = self.cells
+        if len(self.fold_code) != len(self.manifest["block_ids"]):
+            raise ValueError("fold_code length does not match the cell manifest's block list")
+        cell_fold = self.fold_code[c["block_code"]]
+        is_train = cell_fold != self.fold_idx
+        self.train_idx = np.flatnonzero(is_train & (c["n_wetland"] >= self.min_wetland_train))
+        self.val_idx = np.flatnonzero(~is_train)
+
+        if np.any(cell_fold[self.train_idx] == self.fold_idx):
+            raise AssertionError("train cells include val fold cells, the fold mask was dropped")
+        if self.train_idx.size == 0 or self.val_idx.size == 0:
+            raise AssertionError(f"fold {self.fold_idx} has an empty train or val split")
+
+        # All three go through log1p before the z score. The distances run 30 m to
+        # 110 km, but conversion all but stops past 1.5 km (0.01% of 300 m cells
+        # with any conversion), so on raw meters the long tail sets the std and the
+        # 30 to 1,500 m range that carries the signal lands in a sliver near the
+        # bottom. n_wetland runs 1 to 100 at 300 m and 1 to 1,089 at 990 m, and its
+        # effect on the target is roughly logarithmic (figure 3 in
+        # notebooks/cell_analysis.ipynb). Stats from the train cells only, same rule
+        # as dist_norm_stats.
+        raw = np.log1p(np.stack([c["dist_mean"], c["dist_min"], c["n_wetland"]], axis=1).astype(np.float64))
+        mu = raw[self.train_idx].mean(axis=0)
+        sd = raw[self.train_idx].std(axis=0)
+        sd[sd == 0] = 1.0
+        self.scalar_mean, self.scalar_std = mu.astype(np.float32), sd.astype(np.float32)
+        scalars = ((raw - mu) / sd).astype(np.float32)
+
+        self.ds = CellDataset(c, scalars)
+        self.train_sampler = ShuffledIndexSampler(self.train_idx, self.batch_size,
+                                                  seed=self.seed + self.fold_idx)
+        self.log_split()
+
+    def log_split(self):
+        """Cell counts and positive rates for this fold, so a val metric always has
+        the rate it was computed against sitting next to it."""
+        c = self.cells
+        print(f"fold {self.fold_idx}  {self.manifest['cell_size_m']} m cells  "
+              f"min_wetland_train {self.min_wetland_train}")
+        for name, idx in (("train", self.train_idx), ("val", self.val_idx)):
+            n_dev, n_wet = int(c["n_developed"][idx].sum()), int(c["n_wetland"][idx].sum())
+            print(f"  {name:>5}  cells {idx.size:>10,}  any conversion {(c['n_developed'][idx] > 0).mean():.2%}  "
+                  f"mean target {c['target'][idx].mean():.3%}  pixel rate {n_dev / n_wet:.3%}")
+
+    def _loader(self, sampler):
+        return DataLoader(self.ds, batch_size=None, sampler=sampler, num_workers=self.num_workers,
+                          persistent_workers=bool(self.num_workers))
+
+    def train_dataloader(self):
+        return self._loader(self.train_sampler)
+
+    def val_dataloader(self):
+        return self._loader(SequentialIndexSampler(self.val_idx, self.val_batch_size))
+
+    def train_eval_dataloader(self):
+        """Every train cell once, in order, for scoring the fitted model on its own
+        training data with the same metrics as val."""
+        return self._loader(SequentialIndexSampler(self.train_idx, self.val_batch_size))

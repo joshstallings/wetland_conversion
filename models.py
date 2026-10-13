@@ -7,7 +7,29 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim import Adam
 import pytorch_lightning as pl
-from torchmetrics.classification import BinaryPrecision, BinaryRecall, BinaryF1Score
+from torchmetrics import MeanMetric, SumMetric
+from torchmetrics.classification import (BinaryAveragePrecision, BinaryF1Score, BinaryPrecision,
+                                         BinaryRecall)
+
+
+def tcn_dilation(n_years, dilation=None):
+    """
+    Two kernel 2 convs with no padding give a receptive field of 2 + dilation
+    and an output length of n_years - 1 - dilation. Setting dilation to
+    n_years - 2 is the point where the receptive field covers the whole
+    sequence and the length collapses to 1: the two are mutually exclusive
+    without padding, so there is nothing to trade off, it is the only
+    setting that sees all the years. At n_years 3 it works out to 1, which
+    is what the three year runs were trained with.
+    """
+    if dilation is None:
+        dilation = max(1, n_years - 2)
+    if n_years - 1 - dilation < 1:
+        raise ValueError(
+            f"dilation {dilation} leaves no sequence length at n_years {n_years}. "
+            f"The second conv needs n_years - 1 - dilation >= 1."
+        )
+    return dilation
 
 
 class BinaryFocalLoss(nn.Module):
@@ -253,22 +275,7 @@ class TemporalConvolutionalNetwork(pl.LightningModule):
                  threshold=0.5, pos_weight=None, gamma=2.0, alpha=None, weight_decay=0.0,
                  kernel_size=2, dilation=None):
         super().__init__()
-
-        # Two kernel 2 convs with no padding give a receptive field of 2 + dilation
-        # and an output length of n_years - 1 - dilation. Setting dilation to
-        # n_years - 2 is the point where the receptive field covers the whole
-        # sequence and the length collapses to 1: the two are mutually exclusive
-        # without padding, so there is nothing to trade off, it is the only
-        # setting that sees all the years. At n_years 3 it works out to 1, which
-        # is what the three year runs were trained with.
-        if dilation is None:
-            dilation = max(1, n_years - 2)
-        if n_years - 1 - dilation < 1:
-            raise ValueError(
-                f"dilation {dilation} leaves no sequence length at n_years {n_years}. "
-                f"The second conv needs n_years - 1 - dilation >= 1."
-            )
-
+        dilation = tcn_dilation(n_years, dilation)
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
@@ -356,6 +363,155 @@ class TemporalConvolutionalNetwork(pl.LightningModule):
         self.log("val_f1", self.val_f1, on_epoch=True, batch_size=n)
 
         return loss
+
+    def configure_optimizers(self):
+        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+class CellTemporalConvolutionalNetwork(pl.LightningModule):
+    """
+    The pixel TCN reworked for cells: predicts the share of a cell's 2019 wetland
+    that is developed by 2024, from per cell embedding means and stds.
+
+    Batches arrive as (emb_mean, emb_std, scalars, y, n_wetland) from
+    datasets.CellDataModule. emb_mean and emb_std are each (B, n_years * emb_dim),
+    year major. They go into the conv as 2 * emb_dim channels per year, means
+    first, so the sequence is still n_years long and the dilation logic carries
+    over unchanged.
+
+    Output is sigmoid(logit), so predictions stay in [0, 1]. Loss is MSE on that,
+    or with binomial_loss set, BCE on the logit with the share y as a soft target.
+    The binomial version is the log likelihood of n_developed out of n_wetland
+    coin flips once it is weighted by n_wetland. It also drops the p(1 - p) factor
+    MSE picks up through the sigmoid, which mutes converted cells the model scores
+    near 0.
+
+    Either loss is weighted by n_wetland when weight_by_n_wetland is set.
+    Unweighted, a 1 pixel cell that is either 0 or 1 counts as much as a 100 pixel
+    cell, and those small cells carry most of the variance in the target.
+
+    val_mse_weighted and val_log_loss_weighted are logged the same way under every
+    flag combination, so runs can be compared on them. val_loss is whatever the
+    run trained on and is not comparable across flags.
+    """
+
+    def __init__(self, emb_dim=64, n_years=3, n_scalars=3, hidden_dim=128, dropout=0.3,
+                 lr=1e-3, weight_decay=0.0, kernel_size=2, dilation=None,
+                 weight_by_n_wetland=True, binomial_loss=False):
+        super().__init__()
+        dilation = tcn_dilation(n_years, dilation)
+        self.save_hyperparameters()
+        self.lr = lr
+        self.weight_decay = weight_decay
+
+        self.tcn_block = nn.Sequential(nn.Conv1d(2 * emb_dim, hidden_dim, kernel_size=kernel_size),
+                                       nn.BatchNorm1d(hidden_dim), nn.ReLU(),
+                                       nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size,
+                                                 dilation=dilation),
+                                       nn.BatchNorm1d(hidden_dim), nn.ReLU())
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.model = nn.Sequential(
+            nn.Linear(hidden_dim + n_scalars, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+
+        self.train_loss = MeanMetric()
+        self.val_loss = MeanMetric()
+        self.val_mse_weighted = MeanMetric()
+        self.val_log_loss_weighted = MeanMetric()
+        self.val_mae = MeanMetric()
+        self.val_mae_weighted = MeanMetric()
+
+        self.val_auprc = BinaryAveragePrecision()
+        self.val_pos_rate = MeanMetric()
+
+        self.val_pred_pixels = SumMetric()
+        self.val_true_pixels = SumMetric()
+
+    def logits(self, emb_mean, emb_std, scalars):
+        n_years, emb_dim = self.hparams.n_years, self.hparams.emb_dim
+        for name, t in (("emb_mean", emb_mean), ("emb_std", emb_std)):
+            if t.shape[1] != n_years * emb_dim:
+                raise ValueError(
+                    f"{name} has {t.shape[1]} columns against n_years {n_years} times "
+                    f"emb_dim {emb_dim}. Pass the n_years the cells were built with."
+                )
+        mean = emb_mean.float().view(-1, n_years, emb_dim)
+        std = emb_std.float().view(-1, n_years, emb_dim)
+        x = torch.cat([mean, std], dim=2).transpose(1, 2)  # (B, 2 * emb_dim, n_years)
+
+        pooled = self.pool(self.tcn_block(x)).squeeze(-1)
+        return self.model(torch.cat([scalars, pooled], dim=1)).squeeze(1)
+
+    def forward(self, emb_mean, emb_std, scalars):
+        # Probabilities, not logits, so reporting.get_cell_predictions and the
+        # checkpoints trained before binomial_loss existed read the same way.
+        return torch.sigmoid(self.logits(emb_mean, emb_std, scalars))
+
+    def _weights(self, n_wetland):
+        if self.hparams.weight_by_n_wetland:
+            return n_wetland.float()
+        return torch.ones_like(n_wetland, dtype=torch.float32)
+
+    def _per_cell_loss(self, logits, y):
+        # The logits form of BCE, not sigmoid then log: a saturated sigmoid would
+        # hand log a 0. A perfect prediction still scores y log y plus the same
+        # for 1 - y here, not 0, but that floor carries no gradient.
+        if self.hparams.binomial_loss:
+            return F.binary_cross_entropy_with_logits(logits, y, reduction="none")
+        return (torch.sigmoid(logits) - y) ** 2
+
+    def training_step(self, batch, batch_idx):
+        emb_mean, emb_std, scalars, y, n_wetland = batch
+        logits = self.logits(emb_mean, emb_std, scalars)
+        w = self._weights(n_wetland)
+        per_cell = self._per_cell_loss(logits, y)
+        loss = (w * per_cell).sum() / w.sum()
+
+        self.train_loss(per_cell.detach(), weight=w)
+        self.log("train_loss", self.train_loss, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        emb_mean, emb_std, scalars, y, n_wetland = batch
+        logits = self.logits(emb_mean, emb_std, scalars)
+        pred = torch.sigmoid(logits)
+        w = self._weights(n_wetland)
+        n_w = n_wetland.float()
+        err = pred - y
+
+        self.val_loss(self._per_cell_loss(logits, y), weight=w)
+        self.val_mse_weighted(err ** 2, weight=n_w)
+        self.val_log_loss_weighted(
+            F.binary_cross_entropy_with_logits(logits, y, reduction="none"), weight=n_w
+        )
+        self.val_mae(err.abs())
+        self.val_mae_weighted(err.abs(), weight=n_w)
+        any_dev = (y > 0).int()
+        self.val_auprc(pred, any_dev)
+        self.val_pos_rate(any_dev.float())
+        self.val_pred_pixels(pred * n_w)
+        self.val_true_pixels(y * n_w)
+
+        self.log("val_loss", self.val_loss, on_epoch=True, prog_bar=True)
+        self.log("val_mse_weighted", self.val_mse_weighted, on_epoch=True)
+        self.log("val_log_loss_weighted", self.val_log_loss_weighted, on_epoch=True)
+        self.log("val_mae", self.val_mae, on_epoch=True)
+        self.log("val_mae_weighted", self.val_mae_weighted, on_epoch=True)
+        self.log("val_auprc", self.val_auprc, on_epoch=True, prog_bar=True)
+        self.log("val_pos_rate", self.val_pos_rate, on_epoch=True)
+
+    def on_validation_epoch_end(self):
+        true = self.val_true_pixels.compute()
+        ratio = self.val_pred_pixels.compute() / true.clamp(min=1.0)
+        self.log("val_pred_over_actual", ratio)
+        self.val_pred_pixels.reset()
+        self.val_true_pixels.reset()
 
     def configure_optimizers(self):
         return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
