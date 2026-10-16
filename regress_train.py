@@ -37,7 +37,7 @@ from features import YEARS_2017_2019
 from folds import assign_folds
 from population_stats import load_population_stats
 
-CELL_DIR = "data/cells_2019_2024_120m"
+CELL_DIR = "data/cells_2019_2024_300m"
 POPULATION_STATS_PATH = "data/population_stats_2019_2024.json"
 N_YEARS = len(YEARS_2017_2019)
 
