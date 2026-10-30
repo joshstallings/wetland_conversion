@@ -34,6 +34,12 @@ min over the same wetland pixels, in raw meters like the source. Not in
 feature_columns since it is a scalar the trainer transforms on its own (log1p and
 a train fold z score in datasets.py). dist_min is the cell's closest wetland pixel
 to existing development.
+
+area_converted is the percent of the cell's footprint that was 2019 wetland and is
+developed by 2024, so 100 n_developed / footprint_px. Unlike target the denominator
+is the whole cell, so a cell that was mostly upland scores low even if all its
+wetland was developed. It comes straight from the labels, so it is another target,
+not an input: putting it in the feature set leaks the answer.
 """
 
 import argparse
@@ -232,6 +238,7 @@ def main():
     raw = src["label_semantics"]["raw_class_counts"]
     if int(n_developed.sum()) != raw[1] or int(n_other.sum()) != raw[2]:
         raise AssertionError("converted pixel totals do not match the source manifest's raw class counts")
+    area_converted = (100 * n_developed / footprint).astype(np.float32)
     for a in out.values():
         a.flush()
     del out
@@ -240,7 +247,7 @@ def main():
         "target": target, "n_wetland": n_wetland, "n_developed": n_developed,
         "n_other": n_other, "footprint_px": footprint, "block_code": cell_block,
         "cell_rowcol": cell_rowcol, "cell_xy": cell_xy,
-        "dist_mean": dist_mean, "dist_min": dist_min,
+        "dist_mean": dist_mean, "dist_min": dist_min, "area_converted": area_converted,
     }
     for name, a in small.items():
         np.save(out_dir / f"{name}.npy", a)
@@ -283,6 +290,10 @@ def main():
             "never cross a block edge. block_code indexes source manifest block_ids."
         ),
         "footprint_px": "pixel positions the cell covers inside its block, wetland or not",
+        "area_converted": (
+            "percent of footprint_px that was 2019 wetland and is developed by 2024, "
+            "100 n_developed / footprint_px. Label derived, not an input feature."
+        ),
         "pixel_grid": {"x_off": x_off, "y_off": y_off, "pixel_m": PIXEL_M},
         "block_origin_window": {"u0": block_origin[0], "v0": block_origin[1], "block_m": BLOCK_M},
         "block_ids": src["block_ids"],

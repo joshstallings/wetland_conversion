@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import spearmanr
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     average_precision_score,
@@ -69,12 +70,13 @@ def plot_loss_curve(metrics_csv_path, out_path, title, ylabel="Focal loss"):
     plt.close(fig)
 
 
-def plot_confusion_matrix(labels, probs, threshold, out_path, title):
+def plot_confusion_matrix(labels, probs, threshold, out_path, title,
+                          display_labels=("not developed", "developed")):
     preds = (probs >= threshold).astype(int)
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots()
     ConfusionMatrixDisplay(
-        cm, display_labels=["not developed", "developed"]
+        cm, display_labels=list(display_labels)
     ).plot(ax=ax, cmap="Blues", colorbar=False)
     ax.set_title(title)
     fig.savefig(out_path)
@@ -126,6 +128,40 @@ def precision_at_recall(labels, probs, recall_target):
     from precision_recall_curve, np.interp wants it ascending)."""
     precision, recall, _ = precision_recall_curve(labels, probs)
     return float(np.interp(recall_target, recall[::-1], precision[::-1]))
+
+
+def threshold_at_recall(labels, probs, recall_target):
+    """Highest threshold whose recall is still at least recall_target. Meant to be
+    picked on train predictions and carried to val, so val never sets its own cut.
+    recall[i] is the recall of probs >= thresholds[i] and falls as i rises, so the
+    last index still at target is the highest such threshold."""
+    _, recall, thresholds = precision_recall_curve(labels, probs)
+    return float(thresholds[np.flatnonzero(recall[:-1] >= recall_target).max()])
+
+
+# Edges follow the 300 m n_wetland quartiles: 1 pixel cells on their own, then
+# roughly 25th, median, 75th percentile cuts. Upper bound inclusive.
+N_WETLAND_BINS = ((1, 1), (2, 15), (16, 44), (45, 90), (91, None))
+
+
+def auprc_by_n_wetland(labels, probs, n_wetland, bins=N_WETLAND_BINS):
+    """
+    AUPRC within n_wetland bins. A bigger cell has more pixels that could convert,
+    so a classifier can climb the overall ranking just by reading cell size. Within
+    a bin that shortcut is mostly gone. Every row carries its own positive rate,
+    since the rate climbs steeply across bins.
+    """
+    rows = []
+    for lo, hi in bins:
+        m = n_wetland >= lo if hi is None else (n_wetland >= lo) & (n_wetland <= hi)
+        y = labels[m]
+        rows.append({
+            "n_wetland_bin": f"{lo}+" if hi is None else (f"{lo}" if lo == hi else f"{lo} to {hi}"),
+            "n_cells": int(m.sum()),
+            "positive_rate": float(y.mean()) if y.size else float("nan"),
+            "auprc": float(average_precision_score(y, probs[m])) if y.any() else float("nan"),
+        })
+    return rows
 
 
 def write_fold_summary(rows, out_path):
@@ -427,6 +463,22 @@ def get_cell_predictions(model, dataloader):
     return torch.cat(preds).numpy(), torch.cat(targets).numpy(), torch.cat(n_wets).numpy()
 
 
+def get_bag_predictions(model, dataloader):
+    """get_cell_predictions for models.CellAttentionMILClassifier, over the 7
+    tuple packed batches datasets.BagDataModule yields. Same returns."""
+    model.eval()
+    device = next(model.parameters()).device
+    preds, targets, n_wets = [], [], []
+    with torch.no_grad():
+        for emb, dist, bag_id, pos, scalars, y, n_wetland in dataloader:
+            pred = model(emb.to(device), dist.to(device), bag_id.to(device), pos.to(device),
+                         scalars.to(device))
+            preds.append(pred.cpu())
+            targets.append(y)
+            n_wets.append(n_wetland)
+    return torch.cat(preds).numpy(), torch.cat(targets).numpy(), torch.cat(n_wets).numpy()
+
+
 def score_cells(pred, target, n_wetland):
     """
     Everything a regression fold gets judged on. Unweighted metrics count every
@@ -465,16 +517,20 @@ def score_cells(pred, target, n_wetland):
     }
 
 
-def write_regression_summary(rows, out_path):
+REGRESSION_SUMMARY_COLS = ("mse", "zero_mse", "mse_weighted", "log_loss_weighted", "mae", "zero_mae",
+                           "mae_weighted", "auprc", "positive_rate", "pred_over_actual")
+
+
+def write_regression_summary(rows, out_path, base=REGRESSION_SUMMARY_COLS):
     """One row per fold plus the mean and std across folds, printed. The CSV keeps
-    every column score_cells and the training script put in."""
+    every column the training script put in; base picks what gets printed, along
+    with its train_ counterpart where there is one."""
     df = pd.DataFrame(rows)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
 
-    base = ["mse", "zero_mse", "mse_weighted", "log_loss_weighted", "mae", "zero_mae",
-            "mae_weighted", "auprc", "positive_rate", "pred_over_actual"]
+    base = list(base)
     cols = [c for c in base + [f"train_{c}" for c in base] if c in df.columns]
     with pd.option_context("display.width", 200, "display.max_columns", 50):
         print(df[["fold"] + cols])
@@ -674,6 +730,221 @@ def write_train_calibration_pooled(fold_dirs, results_dir):
         results_dir / "training_calibration_pooled_ratio.png",
         "Predicted against actual share converted, training cells, all folds",
         "Actual over predicted share converted by bin, training cells, all folds",
+        label="training", color=TRAIN_COLOR,
+    )
+    table.to_csv(results_dir / "training_calibration_pooled.csv", index=False)
+    return table
+
+
+# Stage two of the hurdle model predicts the natural log of the share converted,
+# on cells with any conversion only. pred below is that log share; target stays
+# the share as stored in the cell artifact, and gets logged here.
+
+
+def smearing_factor(pred, target):
+    """
+    Duan's smearing factor: mean of exp(residual) in log space. exp(pred) is a
+    geometric mean, which sits below the arithmetic mean share, and multiplying by
+    this undoes that on average. Fit it on train cells, apply it to val.
+    """
+    resid = np.log(target.astype(np.float64)) - pred.astype(np.float64)
+    return float(np.mean(np.exp(resid)))
+
+
+def score_log_share(pred, target, n_wetland, smear=1.0):
+    """
+    Everything a stage two fold gets judged on. Every cell here has some
+    conversion, so the positive rate is 100% by construction and there is no
+    AUPRC. Errors are in natural log units of the share.
+
+    pred_over_actual compares total converted pixels after back transforming with
+    exp(pred) * smear. The unsmeared version is there to show how much the
+    smearing is doing.
+    """
+    pred = pred.astype(np.float64)
+    target = target.astype(np.float64)
+    log_t = np.log(target)
+    w = n_wetland.astype(np.float64)
+    err = pred - log_t
+    mse = float(np.mean(err ** 2))
+    actual_px = (target * w).sum()
+    # spearmanr warns and returns nan on a constant pred, which is what the
+    # constant baseline is.
+    spearman = float(spearmanr(pred, log_t)[0]) if np.ptp(pred) > 0 else float("nan")
+    return {
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "mae": float(np.mean(np.abs(err))),
+        "mae_weighted": float(np.average(np.abs(err), weights=w)),
+        "r2": float(1 - (err ** 2).sum() / ((log_t - log_t.mean()) ** 2).sum()),
+        "spearman": spearman,
+        "pred_over_actual": float((np.exp(pred) * smear * w).sum() / actual_px),
+        "pred_over_actual_no_smear": float((np.exp(pred) * w).sum() / actual_px),
+        "smear": smear,
+        "mean_pred": float(pred.mean()),
+        "mean_target": float(log_t.mean()),
+        "n_cells": int(target.size),
+    }
+
+
+def plot_log_share_val_metrics(metrics_csv_paths, out_path, title_suffix=""):
+    """
+    plot_cell_val_metrics for the log share regressor: validation MAE in log
+    units, and predicted over actual converted pixels. No AUPRC panel, since every
+    val cell here converted.
+
+    Predicted over actual is before smearing, from exp(pred) alone, so it sits
+    below 1 even for a model that is right on average in log space.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=150)
+
+    ax = axes[0]
+    for col, color, label in (("val_mae", VAL_COLOR, "every cell counts once"),
+                              ("val_mae_weighted", WEIGHTED_COLOR, "weighted by wetland pixels")):
+        epochs, stacked = _stack_epochs(metrics_csv_paths, col)
+        if stacked is not None:
+            _plot_band(ax, epochs, stacked, color, label)
+    ax.set_ylabel("Mean absolute error (natural log of share)", fontsize=12)
+    ax.set_title(f"Validation MAE, converting cells{title_suffix}", fontsize=14)
+
+    ax = axes[1]
+    epochs, stacked = _stack_epochs(metrics_csv_paths, "val_pred_over_actual")
+    if stacked is not None:
+        _plot_band(ax, epochs, stacked, VAL_COLOR, "validation")
+    ax.axhline(1.0, color=REFERENCE_COLOR, linestyle=":", linewidth=1.5,
+               label="predicted total equals actual")
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("Predicted over actual converted pixels", fontsize=12)
+    ax.set_title(f"Converted area before smearing{title_suffix}", fontsize=14)
+
+    for ax in axes:
+        ax.set_xlabel("Epoch", fontsize=13)
+        ax.tick_params(labelsize=11)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(fontsize=11, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_log_share_hexbin(pred, target, out_path, title, gridsize=40):
+    """
+    Predicted against actual log share, one hexagon count per bin on a log color
+    scale. Expect horizontal stripes: the target is log(k / n_wetland) for small
+    whole numbers k and n_wetland, so it only takes a few hundred distinct values,
+    and the band at log(1 / n_wetland) is the cells with one developed pixel.
+    """
+    log_t = np.log(target.astype(np.float64))
+    lo = min(pred.min(), log_t.min()) - 0.1
+    hi = max(pred.max(), log_t.max()) + 0.1
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=150)
+    hb = ax.hexbin(pred, log_t, gridsize=gridsize, bins="log", mincnt=1, cmap="viridis",
+                   extent=(lo, hi, lo, hi))
+    ax.plot([lo, hi], [lo, hi], color=REFERENCE_COLOR, linestyle=":", linewidth=1.5,
+            label="prediction matches actual")
+    cb = fig.colorbar(hb, ax=ax)
+    cb.set_label("Cells per hexagon (log scale)", fontsize=12)
+    cb.ax.tick_params(labelsize=11)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Predicted log share converted (natural log)", fontsize=12)
+    ax.set_ylabel("Actual log share converted (natural log)", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.legend(fontsize=11, frameon=False, loc="lower right")
+    ax.tick_params(labelsize=11)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_log_share_calibration(pred, target, out_path, ratio_out_path, title, ratio_title,
+                               n_bins=20, label="validation", color=VAL_COLOR):
+    """
+    plot_cell_calibration in log space. Cells sorted by predicted log share into
+    n_bins equal count bins.
+
+    out_path: mean actual against mean predicted log share per bin, on linear
+    axes since both are already logs.
+    ratio_out_path: exp(mean actual minus mean predicted), which is the geometric
+    mean actual share over the geometric mean predicted share. Above 1 the model
+    underpredicts that bin. This is before smearing, which would shift every bin
+    by the same factor.
+
+    Returns the per bin table, which also goes in the CSV next to the PNGs.
+    """
+    log_t = np.log(target.astype(np.float64))
+    order = np.argsort(pred, kind="stable")
+    rows = []
+    for i, b in enumerate(np.array_split(order, n_bins)):
+        rows.append({
+            "bin": i + 1,
+            "n_cells": b.size,
+            "mean_pred_log_share": float(pred[b].mean()),
+            "mean_actual_log_share": float(log_t[b].mean()),
+            "actual_log_share_p10": float(np.percentile(log_t[b], 10)),
+            "actual_log_share_p90": float(np.percentile(log_t[b], 90)),
+        })
+    table = pd.DataFrame(rows)
+    table["geo_actual_over_pred"] = np.exp(table["mean_actual_log_share"] - table["mean_pred_log_share"])
+
+    mp, ma = table["mean_pred_log_share"], table["mean_actual_log_share"]
+    pad = 0.2
+    lo = min(mp.min(), ma.min()) - pad
+    hi = max(mp.max(), ma.max()) + pad
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=150)
+    ax.plot([lo, hi], [lo, hi], color=REFERENCE_COLOR, linestyle=":", linewidth=1.5,
+            label="prediction matches actual")
+    ax.plot(mp, ma, "o-", color=color, linewidth=2, markersize=6,
+            label=f"{label}, {n_bins} bins of {len(pred) // n_bins:,} cells")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("Mean predicted log share converted (natural log)", fontsize=12)
+    ax.set_ylabel("Mean actual log share converted (natural log)", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.legend(fontsize=11, frameon=False, loc="upper left")
+    ax.tick_params(labelsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+    x = table["bin"].to_numpy()
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=150)
+    ax.axhline(1.0, color=REFERENCE_COLOR, linestyle=":", linewidth=1.5, label="prediction matches actual")
+    ax.plot(x, table["geo_actual_over_pred"], "o-", color=color, linewidth=2, markersize=6,
+            label=f"{label}, geometric mean actual over predicted")
+    ax.set_yscale("log")
+    ax.set_xticks(x[::2] if len(x) > 10 else x)
+    ax.set_xlabel("Prediction bin, lowest to highest", fontsize=12)
+    ax.set_ylabel("Actual over predicted share, geometric means (log)", fontsize=12)
+    ax.set_title(ratio_title, fontsize=14)
+    ax.legend(fontsize=11, frameon=False)
+    ax.tick_params(labelsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(ratio_out_path, bbox_inches="tight")
+    plt.close(fig)
+    return table
+
+
+def write_train_log_share_calibration_pooled(fold_dirs, results_dir):
+    """write_train_calibration_pooled for the log share regressor. Same caveat:
+    each train cell shows up once per fold it trained in, so this is the average
+    in sample fit of the fold models, not a once per cell score."""
+    preds, targets = [], []
+    for d in fold_dirs:
+        tr = np.load(Path(d) / "train_preds.npz")
+        preds.append(tr["pred"])
+        targets.append(tr["target"])
+    results_dir = Path(results_dir)
+    table = plot_log_share_calibration(
+        np.concatenate(preds), np.concatenate(targets),
+        results_dir / "training_calibration_pooled.png",
+        results_dir / "training_calibration_pooled_ratio.png",
+        "Predicted against actual log share, training cells that converted",
+        "Actual over predicted share by bin, training cells that converted",
         label="training", color=TRAIN_COLOR,
     )
     table.to_csv(results_dir / "training_calibration_pooled.csv", index=False)

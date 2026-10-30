@@ -1,6 +1,6 @@
 """
 Training entry point for the array pipeline: 5 fold spatially blocked CV of a
-linear baseline over data/arrays.
+pixel classifier (MODEL_CLS) over data/arrays_2019_2024.
 
 Run order from scratch for the 2022 to 2024 horizon:
     python build_labels.py 2024 --base 2022
@@ -27,24 +27,31 @@ import arrays as array_io
 import datasets
 import models
 import reporting
-from features import YEARS_2017_2022, emb_cols
+from features import YEARS_2017_2019, emb_cols
 from folds import assign_folds, log_fold_stats
 from population_stats import load_population_stats
 
 # The three inputs that pin a run's provenance, all named here rather than
 # inherited from a module default, since arrays.ARRAY_DIR still points at the
 # 2019 to 2020 horizon.
-# Wetland in both 2019 and 2022, labeled by 2024, embeddings 2017 to 2022. Swap
-# back to arrays_2019_2024 and YEARS_2017_2019 for the 2019 base year run.
-ARRAY_DIR = "data/arrays_2022_2024"
-POPULATION_STATS_PATH = "data/population_stats_2022_2024.json"
-EMB_COLS = emb_cols(YEARS_2017_2022)
-N_YEARS = len(YEARS_2017_2022)
+# Wetland in 2019, labeled by 2024, embeddings 2017 to 2019. Same artifact as the
+# old data/arrays (built 2026-09-04T20:02:03Z, commit 88e677b), just renamed. For
+# the 2022 base year run swap in arrays_2022_2024, population_stats_2022_2024 and
+# YEARS_2017_2022.
+YEARS = YEARS_2017_2019
+ARRAY_DIR = "data/arrays_2019_2024"
+POPULATION_STATS_PATH = "data/population_stats_2019_2024.json"
+EMB_COLS = emb_cols(YEARS)
+N_YEARS = len(YEARS)
 
-RESULTS_DIR = Path("results/tcn_2022_2024_batch_size_2048")
+# TemporalConvolutionalNetwork or MultiLayerPerceptron. They take different
+# constructor args, see build_model.
+MODEL_CLS = models.MultiLayerPerceptron
+
+RESULTS_DIR = Path("results/mlp_batch_size_2048")
 
 SEED = 0
-N_SPLITS = 3
+N_SPLITS = 5
 
 MAX_EPOCHS = 15
 LR = 1e-3
@@ -216,6 +223,13 @@ class HardNegativeMiner(pl.Callback):
             f"{r['pool_max_block_share']:.1%}, {churn}"
         )
 
+def build_model():
+    if MODEL_CLS is models.TemporalConvolutionalNetwork:
+        return MODEL_CLS(n_years=N_YEARS, lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA)
+    # dist rides in column 0 next to the embeddings, hence the + 1.
+    return MODEL_CLS(n_features=len(EMB_COLS) + 1, lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA)
+
+
 def run_fold(fold_idx, data_module, fold_dir):
     """
     Trains one fold, writes its plots and predictions into fold_dir, returns a
@@ -223,9 +237,7 @@ def run_fold(fold_idx, data_module, fold_dir):
     index and normalization stats.
     """
     index = data_module.index
-    model = models.TemporalConvolutionalNetwork(
-        n_years=N_YEARS, lr=LR, pos_weight=POS_WEIGHT, gamma=GAMMA
-    )
+    model = build_model()
 
     fold_dir.mkdir(parents=True, exist_ok=True)
     fold_name = f"fold_{fold_idx}"
@@ -260,7 +272,7 @@ def run_fold(fold_idx, data_module, fold_dir):
     # EarlyStopping.
     epochs_run = trainer.current_epoch
 
-    best_model = models.TemporalConvolutionalNetwork.load_from_checkpoint(checkpoint.best_model_path)
+    best_model = MODEL_CLS.load_from_checkpoint(checkpoint.best_model_path)
 
     probs, labels = reporting.get_val_predictions(best_model, data_module.val_dataloader())
     np.savez(fold_dir / "val_preds.npz", probs=probs, labels=labels)
@@ -361,6 +373,8 @@ def main():
     )
 
     run_manifest = {
+        "model": MODEL_CLS.__name__,
+        "emb_years": list(YEARS),
         "seed": SEED,
         "n_splits": N_SPLITS,
         "max_epochs": MAX_EPOCHS,

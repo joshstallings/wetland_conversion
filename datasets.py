@@ -6,6 +6,7 @@ parquet.
 """
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -422,10 +423,20 @@ class CellDataModule(pl.LightningDataModule):
     min_wetland_train drops tiny cells from training only. Val always keeps every
     cell in the fold, so val numbers describe the real population and do not move
     when this knob does.
+
+    pos_per_batch None trains on one shuffled pass over the train cells at their
+    natural rate. An int switches to StratifiedBatchSampler with "positive" meaning
+    any conversion in the cell. That is for the stage one classifier only: on the
+    regressor it would inflate the share it learns to predict.
+
+    positive_only keeps only cells with any conversion, in train and in val, for
+    the stage two regressor on log share. val_all_idx and val_all_dataloader still
+    cover every val cell, so stage two can be scored on the cells stage one sees.
     """
 
     def __init__(self, cells, manifest, fold_code, fold_idx, batch_size=1024,
-                 val_batch_size=8192, min_wetland_train=1, num_workers=0, seed=0):
+                 val_batch_size=8192, min_wetland_train=1, pos_per_batch=None,
+                 steps_per_epoch=None, num_workers=0, seed=0, positive_only=False):
         super().__init__()
         self.cells = cells
         self.manifest = manifest
@@ -434,8 +445,11 @@ class CellDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.val_batch_size = val_batch_size
         self.min_wetland_train = min_wetland_train
+        self.pos_per_batch = pos_per_batch
+        self.steps_per_epoch = steps_per_epoch
         self.num_workers = num_workers
         self.seed = seed
+        self.positive_only = positive_only
 
     def setup(self, stage=None):
         if getattr(self, "train_idx", None) is not None:
@@ -446,8 +460,10 @@ class CellDataModule(pl.LightningDataModule):
             raise ValueError("fold_code length does not match the cell manifest's block list")
         cell_fold = self.fold_code[c["block_code"]]
         is_train = cell_fold != self.fold_idx
-        self.train_idx = np.flatnonzero(is_train & (c["n_wetland"] >= self.min_wetland_train))
-        self.val_idx = np.flatnonzero(~is_train)
+        keep = c["n_developed"] > 0 if self.positive_only else np.ones(cell_fold.size, dtype=bool)
+        self.train_idx = np.flatnonzero(is_train & keep & (c["n_wetland"] >= self.min_wetland_train))
+        self.val_idx = np.flatnonzero(~is_train & keep)
+        self.val_all_idx = np.flatnonzero(~is_train)
 
         if np.any(cell_fold[self.train_idx] == self.fold_idx):
             raise AssertionError("train cells include val fold cells, the fold mask was dropped")
@@ -470,9 +486,29 @@ class CellDataModule(pl.LightningDataModule):
         scalars = ((raw - mu) / sd).astype(np.float32)
 
         self.ds = CellDataset(c, scalars)
-        self.train_sampler = ShuffledIndexSampler(self.train_idx, self.batch_size,
-                                                  seed=self.seed + self.fold_idx)
+        if self.positive_only and self.pos_per_batch is not None:
+            raise ValueError("pos_per_batch stratifies on any conversion, which positive_only already fixes at 100%")
+        if self.pos_per_batch is None:
+            if self.steps_per_epoch is not None:
+                raise ValueError("steps_per_epoch only applies with pos_per_batch set")
+            self.train_sampler = ShuffledIndexSampler(self.train_idx, self.batch_size,
+                                                      seed=self.seed + self.fold_idx)
+        else:
+            is_pos = c["n_developed"][self.train_idx] > 0
+            self.train_sampler = StratifiedBatchSampler(
+                self.train_idx[is_pos], self.train_idx[~is_pos],
+                batch_size=self.batch_size, pos_per_batch=self.pos_per_batch,
+                steps_per_epoch=self.steps_per_epoch, seed=self.seed + self.fold_idx,
+            )
         self.log_split()
+
+    @property
+    def batch_positive_rate(self):
+        """Share of train batch cells with any conversion, which is the fold's own
+        rate unless pos_per_batch is set."""
+        if isinstance(self.train_sampler, StratifiedBatchSampler):
+            return self.train_sampler.batch_positive_rate
+        return float((self.cells["n_developed"][self.train_idx] > 0).mean())
 
     def log_split(self):
         """Cell counts and positive rates for this fold, so a val metric always has
@@ -495,7 +531,158 @@ class CellDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return self._loader(SequentialIndexSampler(self.val_idx, self.val_batch_size))
 
+    def val_all_dataloader(self):
+        """Every val cell, converted or not, in val_all_idx order. Same as
+        val_dataloader unless positive_only is set."""
+        return self._loader(SequentialIndexSampler(self.val_all_idx, self.val_batch_size))
+
     def train_eval_dataloader(self):
         """Every train cell once, in order, for scoring the fitted model on its own
         training data with the same metrics as val."""
         return self._loader(SequentialIndexSampler(self.train_idx, self.val_batch_size))
+
+
+BAG_MODES = ("pixels", "cell_mean")
+
+
+def load_bags(cell_dir, cell_manifest, load_emb=True):
+    """
+    The build_bags.py index plus the pixel features it points at, reordered once
+    into cell order. Returns a dict of ptr (n_cells + 1,), log_dist (n_rows,)
+    float32 log1p meters, and emb (n_rows, 192) float16 or None.
+
+    Reordering costs one 22.8 GB resident copy of emb but turns every bag into one
+    contiguous slice. Gathering through pix_idx from the original order would
+    instead hit about 10 short runs per cell, one per pixel row the cell spans.
+    Each block's slice of pix_idx only permutes that block's own rows, so the copy
+    goes one block read at a time.
+
+    load_emb False skips the copy, for the cell_mean control, which never reads
+    pixel embeddings.
+    """
+    cell_dir = Path(cell_dir)
+    with open(cell_dir / "bags_manifest.json") as fh:
+        bag_manifest = json.load(fh)
+    if bag_manifest["cells_built_utc"] != cell_manifest["built_utc"]:
+        raise AssertionError(
+            f"{cell_dir}/pix_idx.npy was built against cells from {bag_manifest['cells_built_utc']}, "
+            f"the cells on disk are from {cell_manifest['built_utc']}. Rerun build_bags.py."
+        )
+
+    array_dir = Path(cell_manifest["source_array_dir"])
+    with open(array_dir / "manifest.json") as fh:
+        src = json.load(fh)
+    pix_idx = np.load(cell_dir / "pix_idx.npy")
+    n_wetland = np.load(cell_dir / "n_wetland.npy")
+    ptr = np.concatenate([[0], np.cumsum(n_wetland, dtype=np.int64)])
+
+    # log1p for the same reason the cell scalars get it: the signal sits in the
+    # 30 to 1,500 m range and the raw tail out to 110 km would set the std.
+    dist = np.load(array_dir / "dist.npy")
+    log_dist = np.log1p(dist[pix_idx]).astype(np.float32)
+    del dist
+
+    emb = None
+    if load_emb:
+        t0 = time.time()
+        src_emb = np.load(array_dir / "emb.npy", mmap_mode="r")
+        emb = np.empty(src_emb.shape, dtype=src_emb.dtype)
+        starts, counts = np.asarray(src["block_spans"], dtype=np.int64).T
+        for code, (s, c) in enumerate(zip(starts, counts)):
+            emb[s:s + c] = np.asarray(src_emb[s:s + c])[pix_idx[s:s + c] - s]
+            if code % 400 == 0:
+                print(f"  reordering emb into cell order, block {code:>5}/{len(starts)}  {time.time() - t0:.0f}s")
+        print(f"emb in cell order: {emb.nbytes / 1e9:.1f} GB in {time.time() - t0:.0f}s")
+
+    return {"ptr": ptr, "log_dist": log_dist, "emb": emb, "manifest": bag_manifest}
+
+
+class BagDataset:
+    """
+    Cells as bags of their wetland pixels, a batch of cell indices at a time.
+
+    Returns packed pixels rather than a padded tensor: emb (N, 192), dist (N,),
+    bag_id (N,) giving each pixel's cell as a position in the batch, pos (N,) its
+    slot within that cell, then scalars (B, 3), target (B,), n_wetland (B,) as in
+    CellDataset. Packed because the pixel encoder has BatchNorm, and padding rows
+    would leak into its batch statistics. The model pads after encoding.
+
+    cell_mean mode is the control for the averaging question. Each cell becomes a
+    bag of one pseudo pixel, its emb_mean and the mean of its pixels' dist
+    feature, so the model and training are identical and only the information
+    differs.
+    """
+
+    def __init__(self, cells, bags, scalars, dist_feat, mode="pixels"):
+        if mode not in BAG_MODES:
+            raise ValueError(f"mode {mode} is not one of {BAG_MODES}")
+        if mode == "pixels" and bags["emb"] is None:
+            raise ValueError("pixels mode needs bags loaded with load_emb=True")
+        self.mode = mode
+        self.ptr = bags["ptr"]
+        self.emb = bags["emb"]
+        self.dist_feat = dist_feat
+        self.emb_mean = cells["emb_mean"]
+        self.target = cells["target"]
+        self.n_wetland = cells["n_wetland"]
+        self.scalars = scalars
+        if mode == "cell_mean":
+            self.cell_dist_feat = (np.add.reduceat(dist_feat, self.ptr[:-1], dtype=np.float64)
+                                   / self.n_wetland).astype(np.float32)
+
+    def __len__(self):
+        return self.target.shape[0]
+
+    def __getitem__(self, idx):
+        idx = np.asarray(idx, dtype=np.int64)
+        b = idx.size
+        if self.mode == "cell_mean":
+            emb = self.emb_mean[idx]
+            dist = self.cell_dist_feat[idx]
+            bag_id = np.arange(b, dtype=np.int64)
+            pos = np.zeros(b, dtype=np.int64)
+        else:
+            lengths = self.n_wetland[idx].astype(np.int64)
+            first = np.cumsum(lengths) - lengths
+            pos = np.arange(lengths.sum(), dtype=np.int64) - np.repeat(first, lengths)
+            rows = np.repeat(self.ptr[idx], lengths) + pos
+            emb = self.emb[rows]
+            dist = self.dist_feat[rows]
+            bag_id = np.repeat(np.arange(b, dtype=np.int64), lengths)
+        return (torch.from_numpy(emb), torch.from_numpy(dist), torch.from_numpy(bag_id),
+                torch.from_numpy(pos), torch.from_numpy(self.scalars[idx]),
+                torch.from_numpy(self.target[idx]), torch.from_numpy(self.n_wetland[idx]))
+
+
+class BagDataModule(CellDataModule):
+    """
+    CellDataModule with cells served as bags. Folds, min_wetland_train, the cell
+    scalars and the samplers all come from the parent unchanged, so val cells and
+    their order match the mean and std classifier exactly and their val_preds
+    join on cell_idx.
+
+    The per pixel dist feature is log1p meters z scored over the pixels of this
+    fold's train cells only, same rule as everywhere else.
+    """
+
+    def __init__(self, cells, manifest, bags, fold_code, fold_idx, bag_mode="pixels", **kwargs):
+        super().__init__(cells, manifest, fold_code, fold_idx, **kwargs)
+        self.bags = bags
+        self.bag_mode = bag_mode
+
+    def setup(self, stage=None):
+        if isinstance(getattr(self, "ds", None), BagDataset):
+            return
+        super().setup(stage)
+
+        in_train = np.zeros(self.cells["n_wetland"].size, dtype=bool)
+        in_train[self.train_idx] = True
+        pix_train = np.repeat(in_train, self.cells["n_wetland"])
+        log_dist = self.bags["log_dist"]
+        mu = float(np.mean(log_dist, where=pix_train, dtype=np.float64))
+        sd = float(np.std(log_dist, where=pix_train, dtype=np.float64)) or 1.0
+        self.dist_mean, self.dist_std = np.float32(mu), np.float32(sd)
+        dist_feat = ((log_dist - self.dist_mean) / self.dist_std).astype(np.float32)
+
+        # The parent's CellDataset already holds the z scored cell scalars.
+        self.ds = BagDataset(self.cells, self.bags, self.ds.scalars, dist_feat, mode=self.bag_mode)
