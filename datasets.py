@@ -351,7 +351,7 @@ def load_cells(cell_dir=CELL_DIR):
     with open(cell_dir / "manifest.json") as fh:
         manifest = json.load(fh)
     names = ("emb_mean", "emb_std", "target", "n_wetland", "n_developed",
-             "dist_mean", "dist_min", "block_code", "footprint_px")
+             "dist_mean", "dist_min", "block_code", "footprint_px", "area_converted")
     cells = {k: np.load(cell_dir / f"{k}.npy") for k in names}
 
     n = manifest["stats"]["n_cells"]
@@ -367,13 +367,17 @@ class CellDataset:
     GatherDataset. Returns (emb_mean (B, 192), emb_std (B, 192), scalars (B, 3),
     target (B,), n_wetland (B,)), all float32 except n_wetland, which stays int32
     so the model can choose whether to weight by it.
+
+    target_key and weight_key pick which cell arrays fill the last two slots. The
+    weight should be the denominator of the target, so target times weight is a
+    pixel count: n_wetland for the share, footprint_px for area_converted.
     """
 
-    def __init__(self, cells, scalars):
+    def __init__(self, cells, scalars, target_key="target", weight_key="n_wetland"):
         self.emb_mean = cells["emb_mean"]
         self.emb_std = cells["emb_std"]
-        self.target = cells["target"]
-        self.n_wetland = cells["n_wetland"]
+        self.target = cells[target_key]
+        self.n_wetland = cells[weight_key]
         self.scalars = scalars
 
     def __len__(self):
@@ -432,11 +436,15 @@ class CellDataModule(pl.LightningDataModule):
     positive_only keeps only cells with any conversion, in train and in val, for
     the stage two regressor on log share. val_all_idx and val_all_dataloader still
     cover every val cell, so stage two can be scored on the cells stage one sees.
+
+    target_key and weight_key go straight to CellDataset. Folds, filters and
+    scalars do not depend on them.
     """
 
     def __init__(self, cells, manifest, fold_code, fold_idx, batch_size=1024,
                  val_batch_size=8192, min_wetland_train=1, pos_per_batch=None,
-                 steps_per_epoch=None, num_workers=0, seed=0, positive_only=False):
+                 steps_per_epoch=None, num_workers=0, seed=0, positive_only=False,
+                 target_key="target", weight_key="n_wetland"):
         super().__init__()
         self.cells = cells
         self.manifest = manifest
@@ -450,6 +458,8 @@ class CellDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.seed = seed
         self.positive_only = positive_only
+        self.target_key = target_key
+        self.weight_key = weight_key
 
     def setup(self, stage=None):
         if getattr(self, "train_idx", None) is not None:
@@ -485,7 +495,7 @@ class CellDataModule(pl.LightningDataModule):
         self.scalar_mean, self.scalar_std = mu.astype(np.float32), sd.astype(np.float32)
         scalars = ((raw - mu) / sd).astype(np.float32)
 
-        self.ds = CellDataset(c, scalars)
+        self.ds = CellDataset(c, scalars, self.target_key, self.weight_key)
         if self.positive_only and self.pos_per_batch is not None:
             raise ValueError("pos_per_batch stratifies on any conversion, which positive_only already fixes at 100%")
         if self.pos_per_batch is None:

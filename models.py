@@ -5,7 +5,7 @@ starting with a basic linear model.
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import AdamW
 import pytorch_lightning as pl
 from torchmetrics import MeanMetric, SumMetric
 from torchmetrics.classification import (BinaryAveragePrecision, BinaryF1Score, BinaryPrecision,
@@ -235,7 +235,7 @@ class SimpleLinearModel(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr)
+        return AdamW(self.parameters(), lr=self.lr)
 
 class MultiLayerPerceptron(pl.LightningModule):
     def __init__(self, n_features, dropout=0.3, lr=1e-3, threshold=0.5,
@@ -307,7 +307,7 @@ class MultiLayerPerceptron(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
     
 class TemporalConvolutionalNetwork(pl.LightningModule):
     def __init__(self, emb_dim=64, n_years=3, hidden_dim=128, dropout=0.3, lr=1e-3,
@@ -404,7 +404,7 @@ class TemporalConvolutionalNetwork(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 class CellTemporalConvolutionalNetwork(pl.LightningModule):
     """
@@ -539,15 +539,14 @@ class CellTemporalConvolutionalNetwork(pl.LightningModule):
         self.val_true_pixels.reset()
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 
-class CellTemporalConvolutionalLogShare(CellTemporalConvolutionalNetwork):
+class _LogShareSteps:
     """
-    Stage two of the hurdle model: the natural log of the share of a cell's 2019
-    wetland developed by 2024, given that some of it was. Same trunk, head and
-    batches as CellTemporalConvolutionalNetwork, with no sigmoid on the output and
-    MSE in log space, every cell counted once.
+    Stage two loss and metrics for any cell trunk with a logits(emb_mean, emb_std,
+    scalars) method: MSE in log space, every cell counted once, no sigmoid on the
+    output. Goes first in the bases so its forward wins over LightningModule's.
 
     Only feed it cells with n_developed > 0 (CellDataModule with positive_only),
     otherwise log(y) is -inf and the loss goes with it.
@@ -555,14 +554,19 @@ class CellTemporalConvolutionalLogShare(CellTemporalConvolutionalNetwork):
     forward returns the predicted log share. exp of it is a geometric mean, which
     sits below the mean share, so val_pred_over_actual reads low until a smearing
     factor is applied (reporting.smearing_factor, done after training).
+
+    Nothing here assumes the share is over wetland. With CellDataModule
+    target_key="area_converted", weight_key="footprint_px" it fits log percent of
+    cell area converted instead, and the n_wetland slot carries footprint_px, so
+    the pixel totals and val_mae_weighted are over cell footprint.
     """
 
-    def __init__(self, emb_dim=64, n_years=3, n_scalars=3, hidden_dim=128, dropout=0.3,
-                 lr=1e-3, weight_decay=0.0, kernel_size=2, dilation=None):
-        super().__init__(emb_dim=emb_dim, n_years=n_years, n_scalars=n_scalars,
-                         hidden_dim=hidden_dim, dropout=dropout, lr=lr,
-                         weight_decay=weight_decay, kernel_size=kernel_size, dilation=dilation,
-                         weight_by_n_wetland=False, binomial_loss=False)
+    def _init_log_share_metrics(self):
+        self.val_loss = MeanMetric()
+        self.val_mae = MeanMetric()
+        self.val_mae_weighted = MeanMetric()
+        self.val_pred_pixels = SumMetric()
+        self.val_true_pixels = SumMetric()
 
     def forward(self, emb_mean, emb_std, scalars):
         return self.logits(emb_mean, emb_std, scalars)
@@ -588,6 +592,31 @@ class CellTemporalConvolutionalLogShare(CellTemporalConvolutionalNetwork):
         self.log("val_loss", self.val_loss, on_epoch=True, prog_bar=True)
         self.log("val_mae", self.val_mae, on_epoch=True)
         self.log("val_mae_weighted", self.val_mae_weighted, on_epoch=True)
+
+    def on_validation_epoch_end(self):
+        # val_pred_over_actual is what the right panel of
+        # reporting.plot_log_share_val_metrics reads.
+        true = self.val_true_pixels.compute()
+        ratio = self.val_pred_pixels.compute() / true.clamp(min=1.0)
+        self.log("val_pred_over_actual", ratio)
+        self.val_pred_pixels.reset()
+        self.val_true_pixels.reset()
+
+
+class CellTemporalConvolutionalLogShare(_LogShareSteps, CellTemporalConvolutionalNetwork):
+    """
+    Stage two of the hurdle model: the natural log of the share of a cell's 2019
+    wetland developed by 2024, given that some of it was. Same trunk, head and
+    batches as CellTemporalConvolutionalNetwork, loss and metrics from
+    _LogShareSteps. The parent already builds the metrics _LogShareSteps uses.
+    """
+
+    def __init__(self, emb_dim=64, n_years=3, n_scalars=3, hidden_dim=128, dropout=0.3,
+                 lr=1e-3, weight_decay=0.0, kernel_size=2, dilation=None):
+        super().__init__(emb_dim=emb_dim, n_years=n_years, n_scalars=n_scalars,
+                         hidden_dim=hidden_dim, dropout=dropout, lr=lr,
+                         weight_decay=weight_decay, kernel_size=kernel_size, dilation=dilation,
+                         weight_by_n_wetland=False, binomial_loss=False)
 
 
 class CellTemporalConvolutionalClassifier(pl.LightningModule):
@@ -666,7 +695,7 @@ class CellTemporalConvolutionalClassifier(pl.LightningModule):
         self.log("val_pos_rate", self.val_pos_rate, on_epoch=True)
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 
 class CellMultiLayerPerceptronClassifier(pl.LightningModule):
@@ -689,7 +718,7 @@ class CellMultiLayerPerceptronClassifier(pl.LightningModule):
             nn.Linear(n_features, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 64),
+            nn.Linear(512, 64), # OG -> 256
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1)
@@ -730,59 +759,30 @@ class CellMultiLayerPerceptronClassifier(pl.LightningModule):
         self.log("val_pos_rate", self.val_pos_rate, on_epoch=True)
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 
-MIL_POOLINGS = ("attention", "max", "mean")
-
-
-class CellAttentionMILClassifier(pl.LightningModule):
+class CellMultiLayerPerceptronLogShare(_LogShareSteps, pl.LightningModule):
     """
-    Stage one of the hurdle model as multiple instance learning: a cell is a bag
-    of its 30 m wetland pixels, and the label is whether any of them is developed
-    by 2024. Only the cell label is used, never which pixel converted.
+    Stage two regressor with no temporal structure, the log share counterpart of
+    CellMultiLayerPerceptronClassifier: same flat input and head, loss and metrics
+    from _LogShareSteps. Baseline for CellTemporalConvolutionalLogShare, so the gap
+    between the two is what the convolution over years buys on the regression side.
 
-    Each pixel goes through the same TCN trunk as TemporalConvolutionalNetwork
-    plus its own dist, then the pixels are pooled to one vector per cell and the
-    head sees that next to the cell scalars. log1p_n_wetland stays in the scalars
-    because attention and mean pooling both hide how big the bag was.
-
-    pooling is gated attention (Ilse, Tomczak and Welling 2018) by default. max
-    matches the label's "any pixel" logic more literally but sends gradient to one
-    pixel per cell, and mean is the closest thing to the averaging this is meant
-    to get away from, so both are ablations.
-
-    Batches are packed pixels from datasets.BagDataset. The encoder runs on the
-    packed (N, ...) tensor so its BatchNorm never sees padding, and only the
-    encoded pixels get padded to (B, max bag, hidden).
+    The first layer is 387 by 256, about 99k weights, against about 29k converting
+    train cells per fold, so check its train and val MSE gap against the TCN's.
     """
 
-    def __init__(self, emb_dim=64, n_years=3, n_scalars=3, hidden_dim=128, attn_dim=64,
-                 dropout=0.3, lr=1e-3, weight_decay=0.0, kernel_size=2, dilation=None,
-                 pooling="attention", gamma=2.0, alpha=None, pos_weight=None):
+    def __init__(self, emb_dim=64, n_years=3, n_scalars=3, dropout=0.3, lr=1e-3,
+                 weight_decay=0.0):
         super().__init__()
-        if pooling not in MIL_POOLINGS:
-            raise ValueError(f"pooling {pooling} is not one of {MIL_POOLINGS}")
-        dilation = tcn_dilation(n_years, dilation)
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
 
-        self.tcn_block = nn.Sequential(nn.Conv1d(emb_dim, hidden_dim, kernel_size=kernel_size),
-                                       nn.BatchNorm1d(hidden_dim), nn.ReLU(),
-                                       nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size,
-                                                 dilation=dilation),
-                                       nn.BatchNorm1d(hidden_dim), nn.ReLU())
-        # One layer after the dist concat so a pixel's distance can interact with
-        # its embedding before pooling, rather than only ever being averaged in.
-        self.instance = nn.Sequential(nn.Linear(hidden_dim + 1, hidden_dim), nn.ReLU())
-
-        self.attn_v = nn.Linear(hidden_dim, attn_dim)
-        self.attn_u = nn.Linear(hidden_dim, attn_dim)
-        self.attn_w = nn.Linear(attn_dim, 1)
-
+        n_features = 2 * n_years * emb_dim + n_scalars
         self.model = nn.Sequential(
-            nn.Linear(hidden_dim + n_scalars, 256),
+            nn.Linear(n_features, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(256, 64),
@@ -790,75 +790,11 @@ class CellAttentionMILClassifier(pl.LightningModule):
             nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
+        self._init_log_share_metrics()
 
-        self.loss_fn = binary_loss(gamma, alpha, pos_weight)
-
-        self.val_auprc = BinaryAveragePrecision()
-        self.val_pos_rate = MeanMetric()
-
-    def encode(self, emb, dist):
-        """(N, n_years * emb_dim) year major pixels and (N,) dist to (N, hidden_dim)."""
-        n_years, emb_dim = self.hparams.n_years, self.hparams.emb_dim
-        if emb.shape[1] != n_years * emb_dim:
-            raise ValueError(
-                f"emb has {emb.shape[1]} columns against n_years {n_years} times "
-                f"emb_dim {emb_dim}. Pass the n_years the arrays were built with."
-            )
-        x = emb.float().view(-1, n_years, emb_dim).transpose(1, 2)
-        h = self.tcn_block(x).mean(dim=2)
-        return self.instance(torch.cat([h, dist.float().unsqueeze(1)], dim=1))
-
-    def pool(self, h, bag_id, pos, n_bags):
-        """Pooled (B, hidden_dim) and the (B, max bag) attention weights, which are
-        None unless pooling is attention. Padded slots get weight exactly 0."""
-        n_slots = int(pos.max()) + 1
-        padded = h.new_zeros(n_bags, n_slots, h.shape[1])
-        padded[bag_id, pos] = h
-        mask = torch.zeros(n_bags, n_slots, dtype=torch.bool, device=h.device)
-        mask[bag_id, pos] = True
-
-        if self.hparams.pooling == "max":
-            return padded.masked_fill(~mask.unsqueeze(-1), float("-inf")).amax(dim=1), None
-        if self.hparams.pooling == "mean":
-            return padded.sum(dim=1) / mask.sum(dim=1, keepdim=True), None
-
-        # Scored on the packed pixels, then scattered into a -inf grid, so padding
-        # never goes through the attention layers. Every bag has at least one
-        # pixel, so no row of the softmax is all -inf.
-        a = self.attn_w(torch.tanh(self.attn_v(h)) * torch.sigmoid(self.attn_u(h))).squeeze(1)
-        scores = h.new_full((n_bags, n_slots), float("-inf"))
-        scores[bag_id, pos] = a
-        weights = torch.softmax(scores, dim=1)
-        return (weights.unsqueeze(-1) * padded).sum(dim=1), weights
-
-    def logits(self, emb, dist, bag_id, pos, scalars, return_attention=False):
-        pooled, weights = self.pool(self.encode(emb, dist), bag_id, pos, scalars.shape[0])
-        out = self.model(torch.cat([scalars, pooled], dim=1)).squeeze(1)
-        return (out, weights) if return_attention else out
-
-    def forward(self, emb, dist, bag_id, pos, scalars):
-        return torch.sigmoid(self.logits(emb, dist, bag_id, pos, scalars))
-
-    def training_step(self, batch, batch_idx):
-        emb, dist, bag_id, pos, scalars, y, _ = batch
-        any_dev = (y > 0).float()
-        loss = self.loss_fn(self.logits(emb, dist, bag_id, pos, scalars), any_dev)
-        self.log("train_loss", loss, on_step=False, on_epoch=True, batch_size=y.numel())
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        emb, dist, bag_id, pos, scalars, y, _ = batch
-        any_dev = (y > 0).float()
-        logits = self.logits(emb, dist, bag_id, pos, scalars)
-        loss = self.loss_fn(logits, any_dev)
-
-        self.val_auprc(torch.sigmoid(logits), any_dev.int())
-        self.val_pos_rate(any_dev)
-
-        n = y.numel()
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, batch_size=n)
-        self.log("val_auprc", self.val_auprc, on_epoch=True, prog_bar=True)
-        self.log("val_pos_rate", self.val_pos_rate, on_epoch=True)
+    def logits(self, emb_mean, emb_std, scalars):
+        x = _cell_sequence(emb_mean, emb_std, self.hparams.n_years, self.hparams.emb_dim)
+        return self.model(torch.cat([scalars, x.flatten(1)], dim=1)).squeeze(1)
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
