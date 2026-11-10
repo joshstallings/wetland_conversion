@@ -704,25 +704,29 @@ class CellMultiLayerPerceptronClassifier(pl.LightningModule):
     and the cell scalars go in as one flat vector. Baseline for
     CellTemporalConvolutionalClassifier, same batches and same loss, so the gap
     between the two is what the convolution over years buys.
+
+    hidden_dims are the hidden layer widths, each followed by ReLU and dropout,
+    before the single logit. The (256, 64) default is the original architecture,
+    and has to stay that way: checkpoints from before hidden_dims existed have no
+    such hparam and rebuild from the default.
     """
 
     def __init__(self, emb_dim=64, n_years=3, n_scalars=3, dropout=0.3, lr=1e-3,
-                 weight_decay=0.0, gamma=2.0, alpha=None, pos_weight=None):
+                 weight_decay=0.0, gamma=2.0, alpha=None, pos_weight=None,
+                 hidden_dims=(256, 64)):
         super().__init__()
+        hidden_dims = tuple(int(h) for h in hidden_dims)
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
 
-        n_features = 2 * n_years * emb_dim + n_scalars
-        self.model = nn.Sequential(
-            nn.Linear(n_features, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 64), # OG -> 256
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1)
-        )
+        layers = []
+        n_in = 2 * n_years * emb_dim + n_scalars
+        for n_out in hidden_dims:
+            layers += [nn.Linear(n_in, n_out), nn.ReLU(), nn.Dropout(dropout)]
+            n_in = n_out
+        layers.append(nn.Linear(n_in, 1))
+        self.model = nn.Sequential(*layers)
 
         self.loss_fn = binary_loss(gamma, alpha, pos_weight)
 
