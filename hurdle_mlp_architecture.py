@@ -1,9 +1,15 @@
 """
 Width and depth sweep for the stage one cell classifier,
-models.CellMultiLayerPerceptronClassifier, on the 300 m cells and the east and
-west folds:
+models.CellMultiLayerPerceptronClassifier, on the east and west folds:
 
-    python hurdle_mlp_architecture.py
+    python hurdle_mlp_architecture.py              # 300 m cells
+    python hurdle_mlp_architecture.py --cells 3km  # 3 km cells
+
+--cells picks data/cells_2019_2024_<size> and writes to
+results/hurdle_mlp_<size>_architecture, so the two sizes never share a results
+directory and never skip each other's runs. Every hyperparameter stays the same
+across sizes. At 3 km there are about 24k cells instead of millions, so 15
+epochs at batch 1024 is only about 280 optimizer steps.
 
 Same task, data, loss and fold handling as hurdle_model_train.py classify: any
 2019 wetland developed by 2024 per cell, focal loss at gamma 2, natural positive
@@ -22,6 +28,7 @@ An architecture whose fold_summary.csv already exists is skipped, so a crashed
 sweep picks up where it stopped. Delete that directory to rerun it.
 """
 
+import argparse
 import json
 
 import matplotlib.pyplot as plt
@@ -38,7 +45,21 @@ import models
 import reporting
 from folds import GEOGRAPHIC_FOLD_NAMES, SPLIT_CENTER
 
+CELL_SIZES = {"300m": "300 m cells", "1km": "1 km cells", "3km": "3 km cells"}
+# Set by configure() from --cells. Defaults to 300 m so importing this module
+# from a notebook still points at the original sweep.
+CELL_SIZE = "300m"
+CELL_LABEL = CELL_SIZES[CELL_SIZE]
 RESULTS_DIR = Path("results/hurdle_mlp_300m_architecture")
+
+
+def configure(cell_size):
+    """Points the sweep and hmt.load_checked_cells at one cell size. hmt reads
+    CELL_DIR when load_checked_cells runs, so setting it here is enough."""
+    global CELL_SIZE, CELL_LABEL, RESULTS_DIR
+    CELL_SIZE, CELL_LABEL = cell_size, CELL_SIZES[cell_size]
+    RESULTS_DIR = Path(f"results/hurdle_mlp_{cell_size}_architecture")
+    hmt.CELL_DIR = f"data/cells_2019_2024_{cell_size}"
 
 # Pinned here rather than read off hmt.FOLD_SCHEME, which gets flipped between
 # runs. load_checked_cells reads the module global when called, so setting it
@@ -122,11 +143,11 @@ def run_fold(hidden_dims, fold_idx, data_module, fold_dir):
     if metrics_csvs:
         reporting.plot_loss_curve(
             metrics_csvs[-1], fold_dir / "loss_curve.png",
-            f"MLP {arch_label(hidden_dims)}, validated on the {val_region}", ylabel=LOSS_NAME,
+            f"MLP {arch_label(hidden_dims)}, {CELL_LABEL}, validated on the {val_region}", ylabel=LOSS_NAME,
         )
     reporting.plot_pr_curve_train_val(
         train_labels, train_prob, labels, prob, out_path=fold_dir / "pr_curve.png",
-        title=f"MLP {arch_label(hidden_dims)}, any conversion per cell, validated on the {val_region}",
+        title=f"MLP {arch_label(hidden_dims)}, any conversion, {CELL_LABEL}, validated on the {val_region}",
     )
 
     threshold = reporting.threshold_at_recall(train_labels, train_prob, RECALL_TARGET)
@@ -176,7 +197,7 @@ def run_architecture(hidden_dims, cells, cell_manifest, fold_code, provenance):
     if metrics_csvs:
         reporting.plot_mean_loss_curve(
             metrics_csvs, arch_dir / "loss_curve_mean.png",
-            f"MLP {arch_label(hidden_dims)}, loss over east and west folds", ylabel=LOSS_NAME,
+            f"MLP {arch_label(hidden_dims)}, {CELL_LABEL}, loss over east and west folds", ylabel=LOSS_NAME,
         )
     fold_preds = []
     for d in fold_dirs:
@@ -184,7 +205,7 @@ def run_architecture(hidden_dims, cells, cell_manifest, fold_code, provenance):
         fold_preds.append((tr["any"], tr["prob"], va["any"], va["prob"]))
     reporting.plot_mean_pr_curve(
         fold_preds, arch_dir / "pr_curve_mean.png",
-        f"MLP {arch_label(hidden_dims)}, any conversion per cell, east and west folds",
+        f"MLP {arch_label(hidden_dims)}, any conversion, {CELL_LABEL}, east and west folds",
         chance_unit="cells",
     )
 
@@ -256,7 +277,7 @@ def plot_auprc_by_size(summary, out_path):
     ax.set_xscale("log")
     ax.set_xlabel("trainable parameters (log scale)", fontsize=13)
     ax.set_ylabel("validation AUPRC, mean of east and west folds", fontsize=12)
-    ax.set_title("Cell conversion classifier: validation AUPRC by MLP width and depth",
+    ax.set_title(f"Conversion classifier on {CELL_LABEL}: validation AUPRC by MLP width and depth",
                  fontsize=13)
     ax.tick_params(labelsize=11)
     ax.spines[["top", "right"]].set_visible(False)
@@ -266,6 +287,10 @@ def plot_auprc_by_size(summary, out_path):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cells", choices=sorted(CELL_SIZES), default="300m")
+    configure(parser.parse_args().cells)
+    print(f"cells from {hmt.CELL_DIR}, results to {RESULTS_DIR}")
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     cells, cell_manifest, fold_code, provenance = hmt.load_checked_cells()
 

@@ -71,7 +71,7 @@ N_YEARS = len(YEARS_2017_2019)
 # take the same batches, so nothing else in this file changes between them.
 MODEL_CLS = models.CellMultiLayerPerceptronClassifier
 
-RESULTS_DIR = Path("results/hurdle_clf_mlp_300m_l2_512")
+RESULTS_DIR = Path("results/hurdle_clf_mlp_300m_128_pos_per_batch")
 
 SEED = 0
 
@@ -82,7 +82,7 @@ SEED = 0
 # half holds half the wetland. East and west then convert at about the same rate,
 # but the south still converts at about twice the north's rate, so a north and
 # south run mixes a shift in base rate into the transfer test.
-FOLD_SCHEME = "east_west"
+FOLD_SCHEME = "blocked"
 BLOCKED_N_SPLITS = 5
 N_SPLITS = BLOCKED_N_SPLITS if FOLD_SCHEME == "blocked" else 2
 
@@ -118,7 +118,7 @@ BATCH_SIZE = 1024
 # conversion, about 28 to 36 per 1,024 batch. Set an int to stratify. Moving it
 # off None moves the sigmoid off the natural prior, which matters once this
 # feeds the hurdle product, not for AUPRC.
-POS_PER_BATCH = None
+POS_PER_BATCH = 128
 
 # Only used with POS_PER_BATCH set. None is one pass over the fold's train
 # positives per epoch, about 450 batches at 64 per batch.
@@ -140,7 +140,7 @@ CLASS_LABELS = ("no conversion", "any conversion")
 
 # Stage two. MIN_WETLAND_TRAIN, VAL_BATCH_SIZE and NUM_WORKERS above are shared.
 # "area" or "share", see REG_TARGETS.
-REG_TARGET = "area"
+REG_TARGET = "share"
 
 # "tcn" or "mlp". Both take the same batches and constructor arguments, and the
 # key goes in the results path so the two never write over each other.
