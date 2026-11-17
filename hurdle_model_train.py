@@ -61,9 +61,10 @@ import models
 import reporting
 from features import YEARS_2017_2019
 from population_stats import load_population_stats
-from folds import SPLIT_CENTER, GEOGRAPHIC_FOLD_NAMES, assign_folds, assign_geographic_folds
+from folds import (SPLIT_CENTER, GEOGRAPHIC_FOLD_NAMES, assign_folds, assign_geographic_folds,
+                   assign_random_folds)
 
-CELL_DIR = "data/cells_2019_2024_300m"
+CELL_DIR = "data/cells_2019_2024_3km"
 POPULATION_STATS_PATH = "data/population_stats_2019_2024.json"
 N_YEARS = len(YEARS_2017_2019)
 
@@ -71,7 +72,7 @@ N_YEARS = len(YEARS_2017_2019)
 # take the same batches, so nothing else in this file changes between them.
 MODEL_CLS = models.CellMultiLayerPerceptronClassifier
 
-RESULTS_DIR = Path("results/hurdle_clf_mlp_300m_128_pos_per_batch")
+RESULTS_DIR = Path("results/hurdle_clf_mlp_3km_bce")
 
 SEED = 0
 
@@ -82,9 +83,13 @@ SEED = 0
 # half holds half the wetland. East and west then convert at about the same rate,
 # but the south still converts at about twice the north's rate, so a north and
 # south run mixes a shift in base rate into the transfer test.
+# "blocked_random" is the same 10 km blocks and seed as "blocked", but each block
+# goes to a uniformly random fold instead of the emptiest one, so the folds come
+# out uneven in rows and positives.
 FOLD_SCHEME = "blocked"
 BLOCKED_N_SPLITS = 5
-N_SPLITS = BLOCKED_N_SPLITS if FOLD_SCHEME == "blocked" else 2
+SEEDED_SCHEMES = ("blocked", "blocked_random")
+N_SPLITS = BLOCKED_N_SPLITS if FOLD_SCHEME in SEEDED_SCHEMES else 2
 
 # Geographic runs get their own results dirs so they never land on top of a
 # blocked run.
@@ -93,8 +98,10 @@ if FOLD_SCHEME != "blocked":
 
 # Written into both stages' run manifests.
 FOLD_SPEC = (
-    {"scheme": "blocked", "n_splits": N_SPLITS, "seed": SEED}
-    if FOLD_SCHEME == "blocked" else
+    {"scheme": FOLD_SCHEME, "n_splits": N_SPLITS, "seed": SEED,
+     "assignment": "greedy into the fold with fewest wetland pixels" if FOLD_SCHEME == "blocked"
+                   else "each block uniformly random over the folds"}
+    if FOLD_SCHEME in SEEDED_SCHEMES else
     {"scheme": FOLD_SCHEME, "n_splits": N_SPLITS, "center_lat_lon": list(SPLIT_CENTER),
      "fold_names": list(GEOGRAPHIC_FOLD_NAMES[FOLD_SCHEME]),
      "center": "2019 wetland pixel median, half the wetland on each side",
@@ -106,7 +113,7 @@ LR = 1e-3
 WEIGHT_DECAY = 0.0
 
 # Focal loss is the default. GAMMA=None falls back to nn.BCEWithLogitsLoss.
-GAMMA = 2.0
+GAMMA = None
 ALPHA = None  # None to disable alpha. Must be None when GAMMA is None.
 
 # No pos_weight, same reasoning as classify_train.py. If POS_PER_BATCH is set,
@@ -118,7 +125,7 @@ BATCH_SIZE = 1024
 # conversion, about 28 to 36 per 1,024 batch. Set an int to stratify. Moving it
 # off None moves the sigmoid off the natural prior, which matters once this
 # feeds the hurdle product, not for AUPRC.
-POS_PER_BATCH = 128
+POS_PER_BATCH = None
 
 # Only used with POS_PER_BATCH set. None is one pass over the fold's train
 # positives per epoch, about 450 batches at 64 per batch.
@@ -311,6 +318,9 @@ def assign_scheme_folds(scheme, population_stats, cell_manifest):
     argument so the fold notebook can draw all three off one load."""
     if scheme == "blocked":
         return assign_folds(population_stats["block_row_counts"], BLOCKED_N_SPLITS, SEED)
+    if scheme == "blocked_random":
+        # Same block list as "blocked", so the two schemes cover identical blocks.
+        return assign_random_folds(population_stats["block_row_counts"].keys(), BLOCKED_N_SPLITS, SEED)
     origin = cell_manifest["block_origin_window"]
     if origin["block_m"] != 10_000:
         raise AssertionError(f"block grid is {origin['block_m']} m, folds.BLOCK_M assumes 10 km")
@@ -354,8 +364,9 @@ def load_checked_cells():
 
     fold_assignment = assign_scheme_folds(FOLD_SCHEME, population_stats, cell_manifest)
     fold_code = array_io.fold_of_code(cell_manifest, fold_assignment)
-    if FOLD_SCHEME == "blocked":
-        print(f"\n=== seed {SEED}, {N_SPLITS} folds ===")
+    if FOLD_SCHEME in SEEDED_SCHEMES:
+        per_fold = np.bincount(fold_code[fold_code >= 0], minlength=N_SPLITS).tolist()
+        print(f"\n=== {FOLD_SCHEME}, seed {SEED}, {N_SPLITS} folds, blocks per fold {per_fold} ===")
     else:
         names = GEOGRAPHIC_FOLD_NAMES[FOLD_SCHEME]
         print(f"\n=== {FOLD_SCHEME} at {SPLIT_CENTER[0]:.4f}, {SPLIT_CENTER[1]:.4f}: fold 0 "

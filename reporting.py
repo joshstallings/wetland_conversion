@@ -24,9 +24,10 @@ from sklearn.metrics import (
 )
 
 # Colorblind safe pair, reused across every figure in here so train and val mean
-# the same thing from plot to plot.
-TRAIN_COLOR = "#D55E00"
-VAL_COLOR = "#0072B2"
+# the same thing from plot to plot. Train is always blue and val always orange,
+# never hardcode the hex values in a plot.
+TRAIN_COLOR = "#0072B2"
+VAL_COLOR = "#D55E00"
 
 
 def get_val_predictions(model, dataloader):
@@ -59,10 +60,10 @@ def plot_loss_curve(metrics_csv_path, out_path, title, ylabel="Focal loss"):
     fig, ax = plt.subplots()
     if "train_loss" in df.columns:
         train_df = df.dropna(subset=["train_loss"])
-        ax.plot(train_df["epoch"], train_df["train_loss"], label="train loss")
+        ax.plot(train_df["epoch"], train_df["train_loss"], color=TRAIN_COLOR, label="train loss")
     if "val_loss" in df.columns:
         val_df = df.dropna(subset=["val_loss"])
-        ax.plot(val_df["epoch"], val_df["val_loss"], label="val loss")
+        ax.plot(val_df["epoch"], val_df["val_loss"], color=VAL_COLOR, label="val loss")
     ax.set_xlabel("epoch")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -97,8 +98,8 @@ def plot_pr_curve_train_val(train_labels, train_probs, val_labels, val_probs, ou
     val_ap = average_precision_score(val_labels, val_probs)
 
     fig, ax = plt.subplots()
-    ax.plot(val_recall, val_precision, color="#0072B2", label=f"validation (AUPRC = {val_ap:.3f})")
-    ax.plot(train_recall, train_precision, color="#D55E00", linestyle="--",
+    ax.plot(val_recall, val_precision, color=VAL_COLOR, label=f"validation (AUPRC = {val_ap:.3f})")
+    ax.plot(train_recall, train_precision, color=TRAIN_COLOR, linestyle="--",
             label=f"train (AUPRC = {train_ap:.3f})")
     ax.set_xlabel("recall")
     ax.set_ylabel("precision")

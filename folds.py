@@ -6,6 +6,9 @@ blocks land in val changes every run unless the same seed is reused.
 assign_geographic_folds is the other option: two folds, Florida cut in half
 north and south or east and west at SPLIT_CENTER. No seed involved, the same
 blocks land on the same side every time.
+
+assign_random_folds is assign_folds without the size balancing: every block
+goes to a uniformly random fold, off the same seed.
 """
 
 import numpy as np
@@ -105,6 +108,22 @@ def assign_folds(block_row_counts, n_splits, seed):
         fold_row_totals[fold] += int(cnt)
 
     return assignment
+
+
+def assign_random_folds(block_ids, n_splits, seed):
+    """
+    Each block drawn into one of n_splits folds independently with equal
+    probability, seeded the same way as assign_folds. No balancing, so fold row
+    counts and positive counts drift apart by however much the draw happens to
+    put them. That spread is the point of running it next to assign_folds: it
+    shows how much the blocked scores move when the folds are not evened out.
+
+    Returns dict block_id (str) -> fold_idx.
+    """
+    block_ids = list(block_ids)
+    rng = np.random.default_rng(seed)
+    draw = rng.integers(0, n_splits, size=len(block_ids))
+    return {str(b): int(f) for b, f in zip(block_ids, draw)}
 
 
 def log_fold_stats(label, row_fold, fold_assignment, n_splits):
